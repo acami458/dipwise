@@ -43,15 +43,17 @@ DB_PATH         = os.path.join(HERE, "stockwatch.db")
 ICON_PATH       = os.path.join(HERE, "icon.png")
 ET              = ZoneInfo("America/New_York")
 PORT            = int(os.environ.get("PORT", "8765"))
-REFRESH_SECONDS = 60
+REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "30"))   # quotation/evaluation cycle (JT: 30 s)
 IDLE_SLEEP_SECONDS   = 300   # market closed: re-check every 5 min and touch NOTHING in the DB,
                              # so Neon's free-tier compute can auto-suspend overnight/weekends
 SYMS_REFRESH_SECONDS = 600   # re-read the watchlist from the DB at most every 10 min while active
 DAILY_SAVE_HOUR      = 15    # persist the daily snapshot once near the close...
 DAILY_SAVE_MINUTE    = 55    # ...at 15:55 ET, instead of rewriting it every minute
-RISE_PCT        = 0.005          # condition 1: price must rise >= 0.5% off the intraday low
-VOL_SPIKE_MULT  = 1.5           # condition 4: last-3-min volume > 150% of the average
-ABOVE_OPEN_STOP = 1.01          # condition 6: stop watching once price >= 1.01 x open
+RISE_PCT        = float(os.environ.get("RISE_PCT", "0.0025"))         # cond 1: >= +0.25% off the intraday low
+VOL_SPIKE_MULT  = float(os.environ.get("VOL_SPIKE_MULT", "1.10"))     # cond 4: last-90 s volume > 110% of average
+ABOVE_OPEN_STOP = float(os.environ.get("ABOVE_OPEN_STOP", "1.0025"))  # cond 6: stop once price >= 1.0025 x open
+AVG_WINDOW_SECONDS = int(os.environ.get("AVG_WINDOW_SECONDS", "90"))  # cond 2/4 look-back (JT: 90 s)
+RISING_OBS      = int(os.environ.get("RISING_OBS", "2"))              # consecutive increasing observations
 # Grandpa's numbered-alarm model (see the INTRADAY sketch): a *new* alarm fires
 # each time the stock carves a fresh lower intraday low and then bounces
 # RISE_PCT off it. Alarm #1 may be a "false alarm"; if the stock keeps making
@@ -59,26 +61,30 @@ ABOVE_OPEN_STOP = 1.01          # condition 6: stop watching once price >= 1.01 
 # signal. NEW_LOW_MIN_DROP keeps trivial new lows from each firing an alarm:
 # the new low must be at least this fraction below the low that fired the
 # previous alarm.
-NEW_LOW_MIN_DROP = float(os.environ.get("NEW_LOW_MIN_DROP", "0.003"))  # 0.3%
+NEW_LOW_MIN_DROP = float(os.environ.get("NEW_LOW_MIN_DROP", "0.002"))  # 0.20% (JT)
 MAX_PER_USER    = 80
 # Active intraday monitoring session(s). Alerts, notifications and event-history
 # entries are only generated while the market is in one of these sessions.
 #   export ALERT_SESSIONS="Pre-market,Open"     (also: "Open" for regular hours only)
-ALERT_SESSIONS  = {s.strip() for s in os.environ.get("ALERT_SESSIONS", "Pre-market,Open").split(",") if s.strip()}
+# JT Rev 1.0 redmarks: regular hours only — no pre-market alerts.
+ALERT_SESSIONS  = {s.strip() for s in os.environ.get("ALERT_SESSIONS", "Open").split(",") if s.strip()}
 # Stale / interrupted data: a ticker whose latest trade is older than this is
 # flagged on the dashboard, gets no alerts, and is recorded in event history.
-STALE_SECONDS     = int(os.environ.get("STALE_SECONDS", "600"))        # regular hours
-STALE_SECONDS_PRE = int(os.environ.get("STALE_SECONDS_PRE", "1200"))   # pre-market (thinner)
+STALE_SECONDS     = int(os.environ.get("STALE_SECONDS", "30"))         # regular hours (JT: 30 s)
+STALE_SECONDS_PRE = int(os.environ.get("STALE_SECONDS_PRE", "150"))    # pre-market, if ever enabled (JT: 150 s)
 # The free IEX feed has no pre-market trades before 8:00 ET; until then tickers
 # show "waiting for pre-market data" instead of being logged as stale.
 IEX_PREMARKET_START = (8, 0)
 # Reset / rearm: after a confirmed alert, a ticker re-arms only when it prints a
 # new low at least NEW_LOW_MIN_DROP below the alerted low (and, optionally, after
 # REARM_MINUTES have passed since the last alert).
-REARM_MINUTES     = float(os.environ.get("REARM_MINUTES", "0"))
+REARM_SECONDS     = float(os.environ.get("REARM_SECONDS", "60"))   # JT: minimum 60 s between alarms
+REARM_MINUTES     = REARM_SECONDS / 60.0
 # Event-history retention in days. 0 = keep forever (default).
-EVENT_RETENTION_DAYS = int(os.environ.get("EVENT_RETENTION_DAYS", "0"))
+EVENT_RETENTION_DAYS = int(os.environ.get("EVENT_RETENTION_DAYS", "1"))   # JT: one day of history
 NOTIFY_CHANNELS   = ("email", "push", "pushover")
+# Email alerts are off unless EMAIL_ALERTS=1 (Render's free plan blocks outgoing email; JT: not needed).
+EMAIL_ALERTS      = os.environ.get("EMAIL_ALERTS", "0").lower() in ("1", "true", "yes", "on")
 APP_URL         = os.environ.get("APP_URL", "").strip()
 
 # JT WatchList (06-15-2026). New accounts start empty; this list is loaded into a
@@ -715,8 +721,12 @@ def get_event_log(uid, limit=300):
 def history_rows(uid, limit=300):
     """Event history plus alarms recorded before this update (kept, not deleted)."""
     rows = get_event_log(uid, limit)
+    cutoff = ((datetime.now(ET).date() - timedelta(days=EVENT_RETENTION_DAYS)).isoformat()
+              if EVENT_RETENTION_DAYS > 0 else "")
     try:
         for r in get_alarm_events(uid, limit):
+            if r["day"] < cutoff:
+                continue
             rows.append({"day": r["day"], "symbol": r["symbol"], "kind": "legacy", "seq": r["num"],
                          "observed_low": None, "prelim_threshold": None, "mipe": r["from_low"],
                          "last_price": r["price"], "quote_time": None,
@@ -735,7 +745,7 @@ def history_csv(rows):
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["Date", "Ticker", "Event", "Alarm #", "Observed low", "Preliminary recovery threshold",
-                "MIPE - minimum intraday price excursion (%)", "Latest valid quotation", "Quote time (ET)",
+                "Recovery at confirmation (%)", "Latest valid quotation", "Quote time (ET)",
                 "Confirmation / log time (ET)", "Email", "Phone push", "Pushover", "Other outcome", "Detail"])
     for r in rows:
         d = r.get("delivery") or {}
@@ -1220,15 +1230,19 @@ def _premarket_wait():
     return None
 
 
-def _staleness(trade_ts):
-    """(stale, reason, log?, quote_time ET 'HH:MM:SS') for the active session."""
+def _staleness(trade_ts, quote_ts=None):
+    """(stale, reason, log?, quote_time ET 'HH:MM:SS') for the active session.
+    Fresh = the newest of the last trade and the last bid/ask quote is within the limit."""
     now = datetime.now(ET)
     qt, age = None, None
-    if trade_ts:
+    for ts in (trade_ts, quote_ts):
+        if not ts:
+            continue
         try:
-            dt = datetime.strptime(trade_ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-            qt = dt.astimezone(ET).strftime("%H:%M:%S")
-            age = (now - dt.astimezone(ET)).total_seconds()
+            dt = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            a = (now - dt.astimezone(ET)).total_seconds()
+            if age is None or a < age:
+                age, qt = a, dt.astimezone(ET).strftime("%H:%M:%S")
         except Exception:
             pass
     ses = session_label(now)
@@ -1239,8 +1253,10 @@ def _staleness(trade_ts):
         wait = _premarket_wait()
         if wait:
             return True, wait[0], False, qt
-        mins = "?" if age is None else f"{int(age // 60)}"
-        return True, f"stale — last trade {mins} min ago", True, qt
+        if age is None:
+            return True, "stale — no recent trade or quote", True, qt
+        ago = f"{int(age)} s" if age < 120 else f"{int(age // 60)} min"
+        return True, f"stale — last update {ago} ago", True, qt
     return False, "", True, qt
 
 
@@ -1273,13 +1289,14 @@ def build_row(t, snap):
                "vwap": None if not vwap else round(vwap, 2),
                "as_of": _as_of(lt.get("t")),
                "quote_time": None, "stale": False, "stale_reason": "",
-               # condition 1: price is >= 0.5% above the intraday low
+               # condition 1: price is >= RISE_PCT above the intraday low
                "near": bool(from_low is not None and from_low >= RISE_PCT * 100),
                "alert": False, "signal": None, "conditions": [],
                "alarm_num": 0, "new_alarm": False,
                # raw minute bar, used by evaluate_signal for the 3-min tests
                "_mb_t": mb.get("t"), "_mb_c": mb.get("c"), "_mb_v": mb.get("v")}
-        stale, reason, log, qt = _staleness(lt.get("t"))
+        stale, reason, log, qt = _staleness(lt.get("t"), (snap.get("latestQuote") or {}).get("t"))
+        row["_cumvol"] = db.get("v")
         row["stale"], row["stale_reason"], row["quote_time"] = stale, reason, qt
         row["_log_stale"] = log
         evaluate_signal(row)
@@ -1309,52 +1326,103 @@ def _update_bars(sym, minute_ts, close, vol):
         return list(lst)
 
 
+# Per-symbol buffer of sampled observations for the 90-second tests and the
+# two-rising-observations rule: [(epoch_seconds, price, cumulative_day_volume)].
+_ticks = {}
+_ticks_lock = threading.Lock()
+_ticks_state = {"day": None}
+TICKS_MAX = 1200
+
+
+def _record_tick(sym, price, cumvol):
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    now = time.time()
+    with _ticks_lock:
+        if _ticks_state["day"] != today:
+            _ticks.clear()
+            _ticks_state["day"] = today
+        lst = _ticks.setdefault(sym, [])
+        if lst and now - lst[-1][0] < 5:          # same refresh cycle (e.g. a page load) — replace
+            lst[-1] = (now, price, cumvol)
+        else:
+            lst.append((now, price, cumvol))
+        if len(lst) > TICKS_MAX:
+            del lst[:len(lst) - TICKS_MAX]
+        return list(lst)
+
+
+def _window_stats(ticks, now):
+    """(avg price over the look-back window, volume traded in the window, average
+    volume per window so far today, consecutive distinct increases)."""
+    win = [t for t in ticks if now - t[0] <= AVG_WINDOW_SECONDS + 1]
+    avg = (sum(t[1] for t in win) / len(win)) if len(win) >= 2 else None
+    vol_win = vol_avg = None
+    if len(ticks) >= 2 and ticks[-1][2] is not None:
+        older = [t for t in ticks if now - t[0] >= AVG_WINDOW_SECONDS - 1 and t[2] is not None]
+        if older:
+            vol_win = ticks[-1][2] - older[-1][2]
+        et = datetime.now(ET)
+        open_dt = et.replace(hour=9, minute=30, second=0, microsecond=0)
+        elapsed = (et - open_dt).total_seconds()
+        if elapsed > AVG_WINDOW_SECONDS:
+            vol_avg = ticks[-1][2] / elapsed * AVG_WINDOW_SECONDS
+    distinct = []
+    for t in ticks:
+        if not distinct or t[1] != distinct[-1]:
+            distinct.append(t[1])
+    rises = 0
+    for i in range(len(distinct) - 1, 0, -1):
+        if distinct[i] > distinct[i - 1]:
+            rises += 1
+        else:
+            break
+    return avg, vol_win, vol_avg, rises
+
+
 def evaluate_signal(row):
     """Apply grandpa's multi-condition logic and attach a confidence score.
 
-    Conditions (from the WatchList "Python" tab):
-      1. price rose >= 0.5% off the intraday low
-      2. price > 3-minute average
+    Conditions (WatchList "Python" tab, as revised in JT's Rev 1.0 redmarks):
+      1. price rose >= RISE_PCT (0.25%) off the intraday low
+      2. price > its 90-second average
       3. price > VWAP
-      4. last-3-min volume > 150% of the average minute volume
+      4. last-90-second volume > 110% of today's average per 90 seconds
       5. price < open  (only hunting for a bounce while still below the open)
-      6. stop once price >= 1.01 x open (the setup has played out)
+      6. stop once price >= 1.0025 x open (the setup has played out)
+    plus the MIPE-SOW reversal rule: two consecutive increasing observations.
     Confidence:  1+2 = Good, 1+2+3 = Very Good, 1+2+3+4 = Excellent.
-    A push/email/Pushover alert fires only when 1 AND 2 AND 5 hold and the
-    stop (6) has not triggered. Conditions 3 and 4 raise the confidence label.
+    An alert fires only when 1, 2, 5 and the rising rule hold and the stop (6)
+    has not triggered. Conditions 3 and 4 raise the confidence label.
     """
     sym = row["ticker"]
     price = row.get("price")
     o = row.get("open")
-    bars = _update_bars(sym, row.pop("_mb_t", None), row.pop("_mb_c", None), row.pop("_mb_v", None))
+    for k in ("_mb_t", "_mb_c", "_mb_v"):
+        row.pop(k, None)
+    cumvol = row.pop("_cumvol", None)
     if price is None:
         return row
+    ticks = _record_tick(sym, price, cumvol)
+    avg90, vol90, volavg, rises = _window_stats(ticks, time.time())
 
-    # Condition 1 — already computed as row["near"].
+    # Condition 1 — already computed as row["near"] (>= RISE_PCT off the low).
     c1 = bool(row.get("near"))
-
-    # Condition 2 — price above the average close of the last 3 minute bars.
-    avg3 = None
-    if bars and len(bars) >= 1:
-        last3 = bars[-3:]
-        avg3 = sum(b[1] for b in last3) / len(last3)
-    c2 = bool(avg3 is not None and price > avg3)
-
+    # Condition 2 — price above its 90-second average (JT redmarks).
+    c2 = bool(avg90 is not None and price > avg90)
     # Condition 3 — price above the daily VWAP.
     vwap = row.get("vwap")
     c3 = bool(vwap is not None and price > vwap)
-
-    # Condition 4 — last-3-min volume exceeds 150% of the average minute volume.
-    c4 = False
-    if bars and len(bars) >= 4:
-        vol3 = sum(b[2] for b in bars[-3:])
-        baseline = sum(b[2] for b in bars) / len(bars)   # avg volume per minute
-        c4 = bool(baseline > 0 and vol3 > VOL_SPIKE_MULT * baseline * 3)
-
+    # Condition 4 — last-90-second volume above 110% of today's average per 90 s.
+    c4 = bool(vol90 is not None and volavg and vol90 > VOL_SPIKE_MULT * volavg)
     # Condition 5 — still trading below the open.
     c5 = bool(o is not None and price < o)
-    # Condition 6 — stop watching once price has recovered to >= 1.01 x open.
+    # Condition 6 — stop once price has recovered to >= ABOVE_OPEN_STOP x open.
     stopped = bool(o is not None and price >= ABOVE_OPEN_STOP * o)
+    # Upward-reversal rule (adopted from the MIPE SOW): at least RISING_OBS
+    # consecutive distinct increasing observations.
+    rising = rises >= RISING_OBS
+    row["rising_obs"] = rises
+    row["avg90"] = None if avg90 is None else round(avg90, 2)
 
     met = [i for i, ok in [(1, c1), (2, c2), (3, c3), (4, c4), (5, c5)] if ok]
     row["conditions"] = met
@@ -1372,13 +1440,13 @@ def evaluate_signal(row):
 
     # Upward-reversal confirmation logic (alert architecture spec):
     #   preliminary  = condition 1 (price >= observed low x (1 + RISE_PCT))
-    #   confirmed    = 1 AND 2 AND 5, and the stop (6) has not triggered
+    #   confirmed    = 1 AND 2 AND 5 AND two rising observations, stop (6) not triggered
     # Only a confirmed event during the active session, on fresh data, fires a
     # numbered alarm. Outside the session nothing here can create a signal —
     # e.g. someone opening the dashboard or exporting history after the close.
     low = row.get("low")
     row["prelim_threshold"] = round(low * (1 + RISE_PCT), 2) if low else None
-    confirmed = bool(c1 and c2 and c5 and not stopped)
+    confirmed = bool(c1 and c2 and c5 and rising and not stopped)
     row["alert"] = confirmed
     log_stale = row.pop("_log_stale", True)
     if session_label(datetime.now(ET)) in ALERT_SESSIONS:
@@ -1501,7 +1569,7 @@ def deliver_alert(uid, email, row, channels):
     num = row.get("alarm_num") or 1
     sig_tag = f" [{sig}]" if sig else ""
     title = f"🔔 {row['ticker']} Alarm #{num}{sig_tag} +{row['from_low']:.2f}% off new low"
-    if "email" in channels:
+    if "email" in channels and EMAIL_ALERTS:
         if not EMAIL_ON:
             out["email"] = "not set up on server"
         else:
@@ -2786,10 +2854,11 @@ def meta():
             "date": now.strftime("%Y-%m-%d"),
             "market_open": market_open(now),
             "session": session_label(now),
-            "rule": f"A numbered alarm fires when a stock bounces {RISE_PCT*100:.1f}%+ off a fresh intraday "
-                    f"low AND the reversal is confirmed (above its 3-minute average, still below the open). "
+            "rule": f"A numbered alarm fires when a stock bounces {RISE_PCT*100:.2f}%+ off a fresh intraday "
+                    f"low AND the reversal is confirmed ({RISING_OBS} rising quotes in a row, above its "
+                    f"{AVG_WINDOW_SECONDS}-second average, still below the open). "
                     f"If it keeps making lower lows you'll see #2, #3… — the bounce off the deepest low is "
-                    f"the real signal. Alerts run during: {', '.join(sorted(ALERT_SESSIONS))}.",
+                    f"the real signal. Alerts run during regular hours (9:30 a.m.–4:00 p.m. ET).",
             "sessions": sorted(ALERT_SESSIONS),
             "have_key": HAVE_DATA,
             "email_on": EMAIL_ON, "push_on": PUSH_ON}
@@ -4057,7 +4126,7 @@ ALERTS_JS = r"""/* ============================================================
    if(!rows.length){box.innerHTML='<div class="empty">No events yet. Confirmed reversals, stale-data conditions and end-of-session expiries during the active session are recorded here with each notification outcome.</div>';}
    else{
     var h='<div style="overflow:auto;max-height:460px"><table class="evtbl"><thead><tr><th>Date</th><th>Ticker</th><th>Event</th><th>#</th>'+
-     '<th>Observed low</th><th>Prelim. threshold</th><th title="Minimum intraday price excursion: % recovered off the low at confirmation">MIPE</th>'+
+     '<th>Observed low</th><th>Prelim. threshold</th><th title="% recovered off the observed low at confirmation">Recovery</th>'+
      '<th>Latest quote</th><th>Quote time</th><th>Confirmed / logged</th><th>Delivery</th></tr></thead><tbody>';
     h+=rows.map(function(r){
      return '<tr><td>'+esc(r.day)+'</td><td><b>'+esc(r.symbol)+'</b></td><td><span class="evk '+esc(r.kind)+'">'+esc(KLABEL[r.kind]||r.kind)+'</span>'+
@@ -5509,7 +5578,7 @@ class Handler(BaseHTTPRequestHandler):
             if uid:
                 self._json({"logged_in": True, "email": get_email(uid),
                             "channels": get_notify_channels(uid),
-                            "channels_available": {"email": EMAIL_ON, "push": PUSH_ON, "pushover": PUSHOVER_ON},
+                            "channels_available": {"email": EMAIL_ON and EMAIL_ALERTS, "push": PUSH_ON, "pushover": PUSHOVER_ON},
                             "sessions": sorted(ALERT_SESSIONS),
                             "alerts_on": get_alerts_on(uid), "email_on": EMAIL_ON, "push_on": PUSH_ON,
                             "watchlist_view": get_watchlist_view(uid)})
