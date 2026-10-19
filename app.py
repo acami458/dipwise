@@ -83,6 +83,13 @@ REARM_MINUTES     = REARM_SECONDS / 60.0
 # Event-history retention in days. 0 = keep forever (default).
 EVENT_RETENTION_DAYS = int(os.environ.get("EVENT_RETENTION_DAYS", "1"))   # JT: one day of history
 NOTIFY_CHANNELS   = ("email", "push", "pushover")
+# Website administrators: may upload the Project Narrative and grant download permission.
+ADMIN_EMAILS      = {e.strip().lower() for e in os.environ.get(
+    "ADMIN_EMAILS", "acami458@gmail.com,torresdjy@sbcglobal.net").split(",") if e.strip()}
+# VWAP label ladder (conditions 7-12, % distance of price from VWAP).
+VWAP_BAND_PCT     = 0.25   # Bad below -0.25 %, Warning from +0.25 %
+VWAP_RISK_PCT     = 0.50   # Risk Alert from +0.50 %
+VWAP_CRIT_PCT     = 1.00   # Critical from +1.00 %
 # Email alerts are off unless EMAIL_ALERTS=1 (Render's free plan blocks outgoing email; JT: not needed).
 EMAIL_ALERTS      = os.environ.get("EMAIL_ALERTS", "0").lower() in ("1", "true", "yes", "on")
 APP_URL         = os.environ.get("APP_URL", "").strip()
@@ -283,6 +290,21 @@ def init_db():
             user_id INTEGER NOT NULL, symbol TEXT NOT NULL, period TEXT NOT NULL,
             grade TEXT, beat REAL, watch TEXT, gold INTEGER DEFAULT 0,
             PRIMARY KEY(user_id, symbol, period))""")
+        # Project Narrative documents (one row per uploaded revision) and per-user
+        # download permission granted by an administrator.
+        if kind == "pg":
+            cur.execute("""CREATE TABLE IF NOT EXISTS narrative_docs(
+                id SERIAL PRIMARY KEY, revision TEXT, filename TEXT, uploaded_by TEXT,
+                uploaded_at TEXT, html TEXT, docx BYTEA)""")
+            cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS can_download INTEGER DEFAULT 0")
+        else:
+            cur.execute("""CREATE TABLE IF NOT EXISTS narrative_docs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, revision TEXT, filename TEXT, uploaded_by TEXT,
+                uploaded_at TEXT, html TEXT, docx BLOB)""")
+            try:
+                cur.execute("ALTER TABLE user_settings ADD COLUMN can_download INTEGER DEFAULT 0")
+            except Exception:
+                pass
         # Event history (alert architecture spec): every confirmed reversal,
         # stale-data condition and session-close expiry, with per-channel
         # notification outcomes. One row per (user, day, symbol, kind, seq).
@@ -716,6 +738,120 @@ def get_event_log(uid, limit=300):
         return rows
     finally:
         conn.close()
+
+
+def is_admin(uid):
+    email = (get_email(uid) or "").lower() if uid else ""
+    return email in ADMIN_EMAILS
+
+
+def can_download(uid):
+    if not uid:
+        return False
+    if is_admin(uid):
+        return True
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT can_download FROM user_settings WHERE user_id=%s", kind), (uid,))
+        r = cur.fetchone()
+        return bool(r and r[0])
+    finally:
+        conn.close()
+
+
+def set_can_download(uid, on):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        val = 1 if on else 0
+        if kind == "pg":
+            cur.execute("""INSERT INTO user_settings(user_id, can_download) VALUES(%s,%s)
+                           ON CONFLICT (user_id) DO UPDATE SET can_download=EXCLUDED.can_download""", (uid, val))
+        else:
+            cur.execute("INSERT OR IGNORE INTO user_settings(user_id, can_download) VALUES(?,?)", (uid, val))
+            cur.execute("UPDATE user_settings SET can_download=? WHERE user_id=?", (val, uid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def users_with_download():
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""SELECT u.id, u.email, COALESCE(s.can_download, 0) FROM users u
+                       LEFT JOIN user_settings s ON u.id=s.user_id ORDER BY u.email""")
+        return [{"id": r[0], "email": r[1], "admin": (r[1] or "").lower() in ADMIN_EMAILS,
+                 "can_download": bool(r[2]) or (r[1] or "").lower() in ADMIN_EMAILS} for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+_NARR_STYLE_MAP = """p[style-name='Title'] => h1.n-title:fresh
+p[style-name='Subtitle'] => p.n-subtitle:fresh
+p[style-name='Caption'] => p.n-caption:fresh
+p[style-name='List Bullet'] => ul > li:fresh"""
+
+
+def narrative_to_html(docx_bytes):
+    import io
+    import mammoth
+    res = mammoth.convert_to_html(io.BytesIO(docx_bytes), style_map=_NARR_STYLE_MAP)
+    return res.value
+
+
+def narrative_save(revision, filename, data, by):
+    html = narrative_to_html(data)
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        blob = data if kind == "pg" else memoryview(data)
+        cur.execute(_ph("""INSERT INTO narrative_docs(revision, filename, uploaded_by, uploaded_at, html, docx)
+                           VALUES(%s,%s,%s,%s,%s,%s)""", kind),
+                    (revision, filename, by, datetime.now(ET).isoformat(timespec="seconds"), html, blob))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def narrative_latest(with_docx=False):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cols = "id, revision, filename, uploaded_by, uploaded_at, html" + (", docx" if with_docx else "")
+        cur.execute(f"SELECT {cols} FROM narrative_docs ORDER BY id DESC LIMIT 1")
+        r = cur.fetchone()
+        if not r:
+            return None
+        d = {"id": r[0], "revision": r[1], "filename": r[2], "uploaded_by": r[3],
+             "uploaded_at": r[4], "html": r[5]}
+        if with_docx:
+            d["docx"] = bytes(r[6]) if r[6] is not None else b""
+        return d
+    finally:
+        conn.close()
+
+
+_narr_rev_cache = {"t": 0.0, "rev": ""}
+
+
+def narrative_revision():
+    """Latest narrative revision label, cached for 10 minutes (shown in the page header)."""
+    if time.time() - _narr_rev_cache["t"] > 600:
+        try:
+            conn, kind = _db()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT revision FROM narrative_docs ORDER BY id DESC LIMIT 1")
+                r = cur.fetchone()
+                _narr_rev_cache["rev"] = (r[0] if r else "") or ""
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        _narr_rev_cache["t"] = time.time()
+    return _narr_rev_cache["rev"]
 
 
 def history_rows(uid, limit=300):
@@ -1425,18 +1561,41 @@ def evaluate_signal(row):
     row["avg90"] = None if avg90 is None else round(avg90, 2)
 
     met = [i for i, ok in [(1, c1), (2, c2), (3, c3), (4, c4), (5, c5)] if ok]
+    if rising:
+        met.append("R")
     row["conditions"] = met
     row["vwap"] = None if vwap is None else round(vwap, 2)
 
-    # Confidence ladder requires the 1+2 base.
-    signal = None
-    if c1 and c2:
-        signal = "Good"
-        if c3:
-            signal = "Very Good"
-            if c4:
-                signal = "Excellent"
-    row["signal"] = signal
+    # VWAP label ladder (conditions 7-12, JT redmarks 10-17-2026). Shows where the
+    # bounce sits relative to VWAP; it labels the setup and never blocks an alarm.
+    #   7  below VWAP (within 0.25 %)     -> Good
+    #   8  just crossed above VWAP        -> Very Good (Excellent with the volume spike, cond 4)
+    #   9  >= +0.25 % above VWAP          -> Warning
+    #   10 >= +0.50 % above VWAP          -> Risk Alert
+    #   11 >= +1.00 % above VWAP          -> Critical
+    #   12 <= -0.25 % below VWAP          -> Bad
+    vdev = None if not vwap else (price - vwap) / vwap * 100
+    crossed = bool(vwap and price >= vwap and any(t[1] < vwap for t in ticks[-4:-1]))
+    vlabel, vcond = None, None
+    if vdev is not None:
+        if vdev >= VWAP_CRIT_PCT:
+            vlabel, vcond = "Critical", 11
+        elif vdev >= VWAP_RISK_PCT:
+            vlabel, vcond = "Risk Alert", 10
+        elif vdev >= VWAP_BAND_PCT:
+            vlabel, vcond = "Warning", 9
+        elif vdev >= 0:
+            vlabel, vcond = ("Excellent" if (crossed and c4) else "Very Good"), 8
+        elif vdev > -VWAP_BAND_PCT:
+            vlabel, vcond = "Good", 7
+        else:
+            vlabel, vcond = "Bad", 12
+    row["vwap_dev"] = None if vdev is None else round(vdev, 2)
+    row["vwap_cond"] = vcond
+    # The label is shown once the bounce is under way (conditions 1 and 2).
+    row["signal"] = vlabel if (c1 and c2) else None
+    if vcond:
+        row["conditions"] = row["conditions"] + [vcond]
 
     # Upward-reversal confirmation logic (alert architecture spec):
     #   preliminary  = condition 1 (price >= observed low x (1 + RISE_PCT))
@@ -2860,6 +3019,7 @@ def meta():
                     f"If it keeps making lower lows you'll see #2, #3… — the bounce off the deepest low is "
                     f"the real signal. Alerts run during regular hours (9:30 a.m.–4:00 p.m. ET).",
             "sessions": sorted(ALERT_SESSIONS),
+            "narrative_rev": narrative_revision(),
             "have_key": HAVE_DATA,
             "email_on": EMAIL_ON, "push_on": PUSH_ON}
 
@@ -4146,6 +4306,137 @@ ALERTS_JS = r"""/* ============================================================
   loadDaily();
  };
 
+ // ---------- Rev 1.2: definitions under the alarm / label boxes ----------
+ var DEFS={
+  'Good':'Bounce under way while the price is still below VWAP (within 0.25%) — buying below the average price of the day. (1+2+7)',
+  'Very Good':'Price has crossed up through VWAP (0 to +0.25% above). (1+2+3+8)',
+  'Excellent':'Price just crossed VWAP with a volume spike (last 90 s volume >110% of average). (1+2+3+4+8)',
+  'Warning':'Price is 0.25% or more above VWAP — the bounce is getting extended. (9)',
+  'Risk Alert':'Price is 0.50% or more above VWAP — higher risk of buying near a short-term top. (10)',
+  'Critical':'Price is 1.00% or more above VWAP — very extended; highest risk. (11)',
+  'Bad':'Price is 0.25% or more below VWAP — the stock is still weak versus the day’s average price. (12)'
+ };
+ function alarmDef(n){
+  return 'Alarm #'+n+' = the '+n+(n==1?'st':n==2?'nd':n==3?'rd':'th')+' confirmed bounce off a new intraday low today. '+
+   'Fires when the price is +0.25% off the low, has risen on 2 quotes in a row, is above its 90-second average, '+
+   'and is still below the open. A higher number means the stock kept making lower lows; the bounce off the deepest low is the stronger signal.';
+ }
+ function showPop(el,html){
+  var old=document.getElementById('defpop'); if(old){var same=old._for===el;old.remove();if(same)return;}
+  var p=document.createElement('div');p.id='defpop';p._for=el;
+  p.style.cssText='position:absolute;z-index:60;max-width:300px;background:#111827;color:#fff;font-size:12px;line-height:1.4;padding:9px 11px;border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,.25)';
+  p.innerHTML=html+'<div style="margin-top:6px;opacity:.7;font-size:11px">Tap again to close</div>';
+  document.body.appendChild(p);
+  var r=el.getBoundingClientRect();
+  var left=Math.min(window.scrollX+r.left, window.scrollX+document.documentElement.clientWidth-p.offsetWidth-8);
+  p.style.left=Math.max(8,left)+'px'; p.style.top=(window.scrollY+r.bottom+6)+'px';
+ }
+ document.addEventListener('click',function(e){
+  var el=e.target.closest&&e.target.closest('.alrm,.sig,.wt-alarm,.wt-sig');
+  if(!el){var o=document.getElementById('defpop');if(o&&!e.target.closest('#defpop'))o.remove();return;}
+  e.stopPropagation();e.preventDefault();
+  var txt=(el.textContent||'').trim(), m=txt.match(/#(\d+)/);
+  if(m){showPop(el,'<b>🔔 '+esc(txt)+'</b><br>'+alarmDef(+m[1]));return;}
+  var lab=txt; var d=DEFS[lab];
+  var all=Object.keys(DEFS).map(function(k){return '<div style="margin-top:3px'+(k===lab?';font-weight:800':';opacity:.8')+'">'+k+': '+DEFS[k]+'</div>';}).join('');
+  showPop(el,'<b>'+esc(lab)+'</b><br>'+(d||'')+'<div style="margin-top:7px;border-top:1px solid #374151;padding-top:5px;font-size:11px">VWAP labels'+all+'</div>');
+ },true);
+ // make the boxes look tappable
+ var st2=document.createElement('style');
+ st2.textContent='.alrm,.sig,.wt-alarm,.wt-sig{cursor:help;text-decoration:underline dotted}'+
+  '.narr-doc{background:#fff;border:1px solid #e7e9ee;border-radius:10px;padding:18px 22px;max-width:900px;line-height:1.5;font-size:14px}'+
+  '.narr-doc.noselect{user-select:none;-webkit-user-select:none}'+
+  '.narr-doc h1{font-size:17px;color:#14395b;margin:18px 0 6px}.narr-doc h1.n-title{font-size:24px;margin-top:0}'+
+  '.narr-doc .n-subtitle{color:#4b6a8a;font-style:italic;margin:0}.narr-doc .n-caption{color:#4b6a8a;font-size:12px;font-weight:700}'+
+  '.narr-doc table{border-collapse:collapse;width:100%;font-size:12.5px;margin:8px 0 14px}'+
+  '.narr-doc td,.narr-doc th{border-bottom:1px solid #dbe4ee;padding:5px 7px;vertical-align:top;text-align:left}'+
+  '.narr-doc tr:first-child td{background:#e7eef6;font-weight:700}'+
+  '.narr-admin{background:#eef3fb;border:1px solid #cfe0f5;border-radius:10px;padding:12px;margin:12px 0;max-width:900px;font-size:13px}';
+ document.head.appendChild(st2);
+
+ // ---------- Rev 1.2: color the numbers in the stock pop-up ----------
+ if(typeof openDetail==='function'){
+  var _od=openDetail;
+  window.openDetail=async function(tk){
+   var res=_od.apply(this,arguments);
+   try{
+    var t=(typeof findRow==='function'&&findRow(tk))||{};var ref=t.prev_close;
+    document.querySelectorAll('#d_stats .stat').forEach(function(row){
+     var sp=row.querySelectorAll('span'); if(sp.length<2)return;
+     var label=sp[0].textContent, v=sp[1], txt=v.textContent;
+     if(/^\$/.test(txt)&&ref!=null&&!/Prev close|Recovery threshold/.test(label)){
+      var num=parseFloat(txt.replace(/[$,]/g,'')); if(!isNaN(num)){v.style.color=num>ref?'#16a34a':(num<ref?'#dc2626':'');v.style.fontWeight='700';}
+     } else if(/^[+-]\d/.test(txt)){
+      v.style.color=txt.charAt(0)==='-'?'#dc2626':'#16a34a';v.style.fontWeight='700';
+     }
+    });
+   }catch(e){}
+   return res;
+  };
+ }
+
+ // ---------- Rev 1.2: Narrative tab ----------
+ function fmtWhen(iso){if(!iso)return '';try{return new Date(iso).toLocaleString([], {dateStyle:'medium',timeStyle:'short'});}catch(e){return iso;}}
+ window.loadNarrative=async function(){
+  var root=document.getElementById('narr-root');
+  try{
+   var d=await (await fetch('/api/narrative',{cache:'no-store'})).json();
+   if(!d.logged_in){root.innerHTML='<div class="empty">Sign in to read the Project Narrative.</div>';return;}
+   var h='<h2>📄 Project Narrative & Statement of Work'+(d.doc&&d.doc.revision?' <span style="font-weight:600;color:#1d4ed8">· '+esc(d.doc.revision)+'</span>':'')+'</h2>';
+   if(d.doc){
+    h+='<div class="bar" style="align-items:center">';
+    if(d.can_download)h+='<a href="/api/narrative/download"><button class="primary">⬇ Download Word document</button></a>';
+    else h+='<span class="muted" style="font-size:12px;color:#4b5563">Read-only. Downloading is limited to users authorized by the website administrator.</span>';
+    h+='<span class="muted" style="font-size:12px;color:#4b5563">Updated '+esc(fmtWhen(d.doc.uploaded_at))+'</span></div>';
+   }
+   if(d.is_admin)h+=adminPanel();
+   h+=d.doc?'<div class="narr-doc'+(d.can_download?'':' noselect')+'" oncontextmenu="return '+(d.can_download?'true':'false')+'">'+d.doc.html+'</div>'
+          :'<div class="empty">No narrative has been uploaded yet.'+(d.is_admin?' Use the upload box above.':'')+'</div>';
+   root.innerHTML=h;
+   if(d.is_admin)loadUsers();
+  }catch(e){root.innerHTML='<div class="warn">Could not load the narrative.</div>';}
+ };
+ function adminPanel(){
+  return '<div class="narr-admin"><b>Administrator</b> — upload a new revision (Word .docx). The newest upload becomes the one everyone sees.'+
+   '<div class="bar" style="margin-top:8px"><input type="file" id="narr-file" accept=".docx">'+
+   '<input id="narr-rev" placeholder="Revision (e.g. Rev 1.2)" style="width:170px">'+
+   '<button class="primary" onclick="uploadNarrative()">Upload</button><span id="narr-msg" style="font-size:12px"></span></div>'+
+   '<div style="margin-top:8px"><b>Download permission</b><div id="narr-users" class="muted">Loading users…</div></div></div>';
+ }
+ window.uploadNarrative=async function(){
+  var f=document.getElementById('narr-file').files[0], m=document.getElementById('narr-msg');
+  if(!f){m.textContent='Choose a .docx file first.';return;}
+  var rev=document.getElementById('narr-rev').value.trim();
+  if(!rev){var mm=f.name.match(/Rev[ _.]*([0-9]+(?:\.[0-9]+)?)/i);rev=mm?('Rev '+mm[1]):'';}
+  m.style.color='#374151';m.textContent='Uploading…';
+  var buf=await f.arrayBuffer(), bytes=new Uint8Array(buf), bin='';
+  for(var i=0;i<bytes.length;i+=8192)bin+=String.fromCharCode.apply(null,bytes.subarray(i,i+8192));
+  var d=await (await fetch('/api/narrative/upload',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({filename:f.name,revision:rev,data:btoa(bin)})})).json();
+  if(d.ok){loadNarrative();refreshRevLine();}else{m.style.color='#b91c1c';m.textContent=d.error||'Upload failed';}
+ };
+ async function loadUsers(){
+  var box=document.getElementById('narr-users');
+  try{
+   var d=await (await fetch('/api/narrative/users',{cache:'no-store'})).json();
+   box.innerHTML=(d.users||[]).map(function(u){
+    return '<label style="display:block;margin-top:3px"><input type="checkbox" '+(u.can_download?'checked':'')+(u.admin?' disabled':'')+
+     ' onchange="setDl('+u.id+',this.checked)"> '+esc(u.email)+(u.admin?' <span class="muted">(administrator)</span>':'')+'</label>';
+   }).join('')||'No users.';
+  }catch(e){box.textContent='Could not load users.';}
+ }
+ window.setDl=async function(id,on){
+  await fetch('/api/narrative/permission',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:id,on:on})});
+ };
+ async function refreshRevLine(){
+  try{
+   var d=await (await fetch('/api/narrative',{cache:'no-store'})).json();
+   var el=document.getElementById('narrrev');
+   if(el)el.innerHTML=(d.doc&&d.doc.revision)?'Project Narrative: <a href="#" onclick="showTab(\'narr\');return false">'+esc(d.doc.revision)+'</a>':'';
+  }catch(e){}
+ }
+ refreshRevLine(); setInterval(refreshRevLine, 600000);
+
  initStation();
  if(typeof ME!=='undefined'&&ME.logged_in)renderChannels();
 })();
@@ -4251,6 +4542,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 </style></head><body>
 <h1>📈 Stock Watch</h1>
 <div class="meta" id="asof">loading…</div>
+<div class="meta" id="narrrev"></div>
 <div class="rule" id="rule"></div>
 <div id="warn"></div>
 <div id="authbox"></div>
@@ -4261,6 +4553,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <button id="tab-sim" class="tab" onclick="showTab('sim')">🧪 SimuWatch</button>
   <button id="tab-earn" class="tab" onclick="showTab('earn')">📅 Earnings</button>
   <button id="tab-simucal" class="tab" onclick="showTab('simucal')">🎯 SimuCal</button>
+  <button id="tab-narr" class="tab" onclick="showTab('narr')">📄 Narrative</button>
 </div>
 
 <div id="view-watch">
@@ -4312,6 +4605,10 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <div class="foot">Objective columns auto-fill from Finnhub and refresh on their own. <b>Grade</b>, <b>Beat %</b> and <b>What to Watch</b> are yours — edits save to your account. Tap ☆ to flag a market-mover; ⧉ opens Earnings Whispers for the whisper number.</div>
 </div>
 
+<div id="view-narr" style="display:none">
+  <div id="narr-root"><div class="empty">Loading…</div></div>
+</div>
+
 <div id="view-simucal" style="display:none">
   <h2>🎯 SimuCal <span class="muted" style="font-weight:400;font-size:13px">· v5.0 anchored rubric</span></h2>
   <div class="bar" style="align-items:center;margin-top:8px">
@@ -4348,8 +4645,8 @@ function money(v){return (v===null||v===undefined)?'<span class="muted">—</spa
 function beep(){try{var a=new (window.AudioContext||window.webkitAudioContext)();var o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.type='sine';o.frequency.value=880;g.gain.setValueAtTime(0.0001,a.currentTime);g.gain.exponentialRampToValueAtTime(0.12,a.currentTime+0.02);g.gain.exponentialRampToValueAtTime(0.0001,a.currentTime+0.5);o.start();o.stop(a.currentTime+0.52);}catch(e){}}
 function sigBadge(t){
  if(!t.signal)return '';
- var bg={'Good':'#fef3c7','Very Good':'#dbeafe','Excellent':'#dcfce7'}[t.signal]||'#eee';
- var fg={'Good':'#92400e','Very Good':'#1e40af','Excellent':'#166534'}[t.signal]||'#333';
+ var bg={'Good':'#fef3c7','Very Good':'#dbeafe','Excellent':'#dcfce7','Warning':'#ffedd5','Risk Alert':'#fed7aa','Critical':'#fee2e2','Bad':'#e5e7eb'}[t.signal]||'#eee';
+ var fg={'Good':'#92400e','Very Good':'#1e40af','Excellent':'#166534','Warning':'#9a3412','Risk Alert':'#7c2d12','Critical':'#991b1b','Bad':'#374151'}[t.signal]||'#333';
  return '<span class="sig" style="background:'+bg+';color:'+fg+'">'+t.signal+'</span>';
 }
 function alarmBadge(t){
@@ -4363,6 +4660,7 @@ function card(t,blink){
  return '<div class="'+cls+'" onclick="openDetail(\\''+t.ticker+'\\')">'+x+'<span class="tk">'+t.ticker+'</span>'+sigBadge(t)+alarmBadge(t)+(window.pendingBadge?pendingBadge(t):'')+'<span class="pr">'+money(t.price)+'</span>'+
   '<div class="row">change: '+pctSpan(t.change)+'</div>'+
   '<div class="row">from day low: '+pctSpan(t.from_low)+'</div>'+
+  '<div class="row">day low: <span class="dn">'+(t.low==null?'—':'$'+t.low.toFixed(2))+'</span></div>'+
   '<div class="row muted">open: '+(t.open==null?'—':'$'+t.open.toFixed(2))+' · prev: '+(t.prev_close==null?'—':'$'+t.prev_close.toFixed(2))+'</div>'+
   '<div class="row muted">VWAP: '+(t.vwap==null?'—':'$'+t.vwap.toFixed(2))+'</div>'+
   '<div class="row muted">'+(t.as_of||'')+'</div>'+earnCardBadge(t)+(window.staleBadge?staleBadge(t):'')+'</div>';
@@ -4611,6 +4909,9 @@ function showTab(t){
  document.getElementById('tab-sim').classList.toggle('active',t==='sim');
  document.getElementById('tab-earn').classList.toggle('active',t==='earn');
  document.getElementById('tab-simucal').classList.toggle('active',t==='simucal');
+ document.getElementById('view-narr').style.display=(t==='narr')?'block':'none';
+ document.getElementById('tab-narr').classList.toggle('active',t==='narr');
+ if(t==='narr'&&window.loadNarrative)window.loadNarrative();
  if(t==='history')loadHistory();
  if(t==='sim'&&window.initSim)window.initSim();
  if(t==='earn')loadEarnings();
@@ -5548,6 +5849,32 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, CALC_PAGE.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path.startswith("/icon.png") or self.path.startswith("/apple-touch-icon"):
             self._send(200, icon_bytes(), "image/png")
+        elif self.path.startswith("/api/narrative/download"):
+            uid = self._uid()
+            if not can_download(uid):
+                return self._send(403, b"Download is limited to users authorized by the website administrator.",
+                                  "text/plain")
+            doc = narrative_latest(with_docx=True)
+            if not doc or not doc.get("docx"):
+                return self._send(404, b"No narrative uploaded yet.", "text/plain")
+            fn = doc.get("filename") or "Stock Watch Project Narrative.docx"
+            self._send(200, doc["docx"],
+                       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                       extra=[("Content-Disposition",
+                               "attachment; filename=\"" + fn.replace('"', "") + "\"; filename*=UTF-8''"
+                               + urllib.parse.quote(fn))])
+        elif self.path.startswith("/api/narrative/users"):
+            uid = self._uid()
+            if not is_admin(uid):
+                return self._json({"error": "Administrators only."})
+            self._json({"users": users_with_download()})
+        elif self.path.startswith("/api/narrative"):
+            uid = self._uid()
+            if not uid:
+                return self._json({"logged_in": False})
+            doc = narrative_latest()
+            self._json({"logged_in": True, "doc": doc, "is_admin": is_admin(uid),
+                        "can_download": can_download(uid)})
         elif self.path.startswith("/alerts.js"):
             self._send(200, ALERTS_JS.encode("utf-8"), "application/javascript")
         elif self.path.startswith("/api/hist/alerts"):
@@ -5578,6 +5905,7 @@ class Handler(BaseHTTPRequestHandler):
             if uid:
                 self._json({"logged_in": True, "email": get_email(uid),
                             "channels": get_notify_channels(uid),
+                            "is_admin": is_admin(uid), "can_download": can_download(uid),
                             "channels_available": {"email": EMAIL_ON and EMAIL_ALERTS, "push": PUSH_ON, "pushover": PUSHOVER_ON},
                             "sessions": sorted(ALERT_SESSIONS),
                             "alerts_on": get_alerts_on(uid), "email_on": EMAIL_ON, "push_on": PUSH_ON,
@@ -5744,6 +6072,36 @@ class Handler(BaseHTTPRequestHandler):
             if not uid:
                 return self._json({"error": "Please log in first."})
             set_alerts_on(uid, bool(body.get("on")))
+            return self._json({"ok": True})
+        elif self.path.startswith("/api/narrative/upload"):
+            uid = self._uid()
+            if not is_admin(uid):
+                return self._json({"error": "Only the website administrator can upload the narrative."})
+            try:
+                raw = base64.b64decode(body.get("data") or "")
+            except Exception:
+                return self._json({"error": "Could not read the file."})
+            fn = os.path.basename(str(body.get("filename") or "narrative.docx"))[:200]
+            if not raw or raw[:2] != b"PK" or not fn.lower().endswith(".docx"):
+                return self._json({"error": "Please choose a Word (.docx) file."})
+            if len(raw) > 8_000_000:
+                return self._json({"error": "File is larger than 8 MB."})
+            rev = (str(body.get("revision") or "").strip() or "—")[:40]
+            try:
+                narrative_save(rev, fn, raw, get_email(uid))
+            except Exception as e:
+                return self._json({"error": f"Could not convert the document: {str(e)[:160]}"})
+            _narr_rev_cache["t"] = 0
+            return self._json({"ok": True})
+        elif self.path.startswith("/api/narrative/permission"):
+            uid = self._uid()
+            if not is_admin(uid):
+                return self._json({"error": "Administrators only."})
+            try:
+                target = int(body.get("user_id"))
+            except Exception:
+                return self._json({"error": "Bad user."})
+            set_can_download(target, bool(body.get("on")))
             return self._json({"ok": True})
         elif self.path.startswith("/api/prefs/channels"):
             uid = self._uid()
