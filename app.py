@@ -4597,6 +4597,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 <h1>📈 Dipwise</h1>
 <div class="meta" id="asof">loading…</div>
 <div class="meta" id="narrrev"></div>
+<div class="meta" id="social">Follow @dipwiselocker: <a href="https://instagram.com/dipwiselocker" target="_blank" rel="noopener">Instagram</a> · <a href="https://x.com/dipwiselocker" target="_blank" rel="noopener">X</a></div>
 <div class="rule" id="rule"></div>
 <div id="warn"></div>
 <div id="authbox"></div>
