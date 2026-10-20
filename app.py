@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stock Watch — single watchlist, REAL-TIME data via Alpaca (IEX feed, free).
+Dipwise (formerly Stock Watch) — single watchlist, REAL-TIME data via Alpaca (IEX feed, free).
 Add box at top, amber 30s flash + sound on new alerts, tap for chart, email/push.
 ENV: ALPACA_KEY, ALPACA_SECRET, DATABASE_URL, SECRET_KEY,
      SMTP_* (email, optional), VAPID_* (push, optional), APP_URL
@@ -1314,7 +1314,7 @@ def fetch_snapshots(syms):
     """
     out = {}
     headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET,
-               "User-Agent": "stock-watch"}
+               "User-Agent": "dipwise"}
     with _bad_lock:
         known_bad = set(_bad_symbols)
     for chunk in _chunks(sorted(set(syms)), 90):
@@ -1755,7 +1755,7 @@ def send_pushover(title, body):
             "message": body,
             "url": APP_URL or "",
         }).encode()
-        req = urllib.request.Request(PUSHOVER_URL, data=data, headers={"User-Agent": "stock-watch"})
+        req = urllib.request.Request(PUSHOVER_URL, data=data, headers={"User-Agent": "dipwise"})
         with urllib.request.urlopen(req, timeout=15) as r:
             r.read()
         return True
@@ -1933,7 +1933,7 @@ def fetch_daily_bars(syms, days=365):
     start = end - timedelta(days=days)
     start_s, end_s = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
     headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET,
-               "User-Agent": "stock-watch"}
+               "User-Agent": "dipwise"}
     bars_url = "https://data.alpaca.markets/v2/stocks/bars"
     out = {}
     for chunk in _chunks(sorted(set(syms)), 90):
@@ -2038,7 +2038,7 @@ def _finnhub_get(path, params):
     params = dict(params or {})
     params["token"] = FINNHUB_KEY
     url = FINNHUB_URL + path + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": "stock-watch"})
+    req = urllib.request.Request(url, headers={"User-Agent": "dipwise"})
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode())
 
@@ -3069,15 +3069,15 @@ def meta():
 
 
 MANIFEST = json.dumps({
-    "name": "Stock Watch", "short_name": "Stock Watch", "start_url": "/",
+    "name": "Dipwise", "short_name": "Dipwise", "start_url": "/",
     "display": "standalone", "background_color": "#f6f7f9", "theme_color": "#1d4ed8",
     "icons": [{"src": "/icon.png", "sizes": "192x192", "type": "image/png"},
               {"src": "/icon.png", "sizes": "512x512", "type": "image/png"}],
 })
 
 SW_JS = """self.addEventListener('push', function(e){
-  var d={}; try{d=e.data.json();}catch(_){d={title:'Stock Watch', body:(e.data?e.data.text():'')};}
-  e.waitUntil(self.registration.showNotification(d.title||'Stock Watch',
+  var d={}; try{d=e.data.json();}catch(_){d={title:'Dipwise', body:(e.data?e.data.text():'')};}
+  e.waitUntil(self.registration.showNotification(d.title||'Dipwise',
     {body:d.body||'', icon:'/icon.png', badge:'/icon.png', data:(d.url||'/')}));
 });
 self.addEventListener('notificationclick', function(e){
@@ -3521,7 +3521,7 @@ SIMUCAL_JS = r"""/* ============================================================
 
 
 SIM_JS = r"""/* ============================================================
-   Stock Watch — Backtest simulator ("buy the lowest")
+   Dipwise — Backtest simulator ("buy the lowest")
    Served at /sim.js. Depends on Chart.js (already loaded by the page)
    and on the app's existing /api/quotes and /api/hist/daily endpoints.
    All logic is client-side; nothing here touches the server data layer.
@@ -4498,11 +4498,11 @@ ALERTS_JS = r"""/* ============================================================
 
 
 PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>Stock Watch</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Dipwise</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="Stock Watch">
+<meta name="apple-mobile-web-app-title" content="Dipwise">
 <meta name="theme-color" content="#1d4ed8">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
@@ -4594,7 +4594,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .earn-badge.soon{background:#fef3c7;color:#92400e;border-color:#fcd34d}
 .earn-badge.imm{background:#fee2e2;color:#991b1b;border-color:#fca5a5}
 </style></head><body>
-<h1>📈 Stock Watch</h1>
+<h1>📈 Dipwise</h1>
 <div class="meta" id="asof">loading…</div>
 <div class="meta" id="narrrev"></div>
 <div class="rule" id="rule"></div>
@@ -5911,7 +5911,7 @@ class Handler(BaseHTTPRequestHandler):
             doc = narrative_latest(with_docx=True)
             if not doc or not doc.get("docx"):
                 return self._send(404, b"No narrative uploaded yet.", "text/plain")
-            fn = doc.get("filename") or "Stock Watch Project Narrative.docx"
+            fn = doc.get("filename") or "Dipwise Project Narrative.docx"
             self._send(200, doc["docx"],
                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                        extra=[("Content-Disposition",
@@ -5944,7 +5944,7 @@ class Handler(BaseHTTPRequestHandler):
             if not uid:
                 return self._send(401, b"Please log in first.", "text/plain")
             data = history_csv(history_rows(uid, limit=100000))
-            fn = f"stockwatch_event_history_{datetime.now(ET).strftime('%Y-%m-%d')}.csv"
+            fn = f"dipwise_event_history_{datetime.now(ET).strftime('%Y-%m-%d')}.csv"
             self._send(200, data, "text/csv; charset=utf-8",
                        extra=[("Content-Disposition", f'attachment; filename="{fn}"')])
         elif self.path.startswith("/api/hist/daily"):
@@ -6263,7 +6263,7 @@ def main():
     print(f"Icon: {'icon.png found' if os.path.exists(ICON_PATH) else 'using fallback (add icon.png)'}")
     threading.Thread(target=refresher, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"Stock Watch running on http://localhost:{PORT}  (Ctrl+C to stop)")
+    print(f"Dipwise running on http://localhost:{PORT}  (Ctrl+C to stop)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
