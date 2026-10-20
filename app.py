@@ -297,12 +297,17 @@ def init_db():
                 id SERIAL PRIMARY KEY, revision TEXT, filename TEXT, uploaded_by TEXT,
                 uploaded_at TEXT, html TEXT, docx BYTEA)""")
             cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS can_download INTEGER DEFAULT 0")
+            cur.execute("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS narr_blocked INTEGER DEFAULT 0")
         else:
             cur.execute("""CREATE TABLE IF NOT EXISTS narrative_docs(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, revision TEXT, filename TEXT, uploaded_by TEXT,
                 uploaded_at TEXT, html TEXT, docx BLOB)""")
             try:
                 cur.execute("ALTER TABLE user_settings ADD COLUMN can_download INTEGER DEFAULT 0")
+            except Exception:
+                pass
+            try:
+                cur.execute("ALTER TABLE user_settings ADD COLUMN narr_blocked INTEGER DEFAULT 0")
             except Exception:
                 pass
         # Event history (alert architecture spec): every confirmed reversal,
@@ -745,11 +750,43 @@ def is_admin(uid):
     return email in ADMIN_EMAILS
 
 
+def narr_blocked(uid):
+    """True when an administrator has blocked this user from the Narrative tab."""
+    if not uid or is_admin(uid):
+        return False
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT narr_blocked FROM user_settings WHERE user_id=%s", kind), (uid,))
+        r = cur.fetchone()
+        return bool(r and r[0])
+    finally:
+        conn.close()
+
+
+def set_narr_blocked(uid, on):
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        val = 1 if on else 0
+        if kind == "pg":
+            cur.execute("""INSERT INTO user_settings(user_id, narr_blocked) VALUES(%s,%s)
+                           ON CONFLICT (user_id) DO UPDATE SET narr_blocked=EXCLUDED.narr_blocked""", (uid, val))
+        else:
+            cur.execute("INSERT OR IGNORE INTO user_settings(user_id, narr_blocked) VALUES(?,?)", (uid, val))
+            cur.execute("UPDATE user_settings SET narr_blocked=? WHERE user_id=?", (val, uid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def can_download(uid):
     if not uid:
         return False
     if is_admin(uid):
         return True
+    if narr_blocked(uid):
+        return False
     conn, kind = _db()
     try:
         cur = conn.cursor()
@@ -780,10 +817,17 @@ def users_with_download():
     conn, kind = _db()
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT u.id, u.email, COALESCE(s.can_download, 0) FROM users u
+        cur.execute("""SELECT u.id, u.email, COALESCE(s.can_download, 0), COALESCE(s.narr_blocked, 0) FROM users u
                        LEFT JOIN user_settings s ON u.id=s.user_id ORDER BY u.email""")
-        return [{"id": r[0], "email": r[1], "admin": (r[1] or "").lower() in ADMIN_EMAILS,
-                 "can_download": bool(r[2]) or (r[1] or "").lower() in ADMIN_EMAILS} for r in cur.fetchall()]
+        out = []
+        for r in cur.fetchall():
+            adm = (r[1] or "").lower() in ADMIN_EMAILS
+            blocked = bool(r[3]) and not adm
+            if blocked:
+                continue  # removed users are hidden from the administrator list
+            out.append({"id": r[0], "email": r[1], "admin": adm, "blocked": blocked,
+                        "can_download": adm or (bool(r[2]) and not blocked)})
+        return out
     finally:
         conn.close()
 
@@ -4382,6 +4426,7 @@ ALERTS_JS = r"""/* ============================================================
   try{
    var d=await (await fetch('/api/narrative',{cache:'no-store'})).json();
    if(!d.logged_in){root.innerHTML='<div class="empty">Sign in to read the Project Narrative.</div>';return;}
+   if(d.blocked){root.innerHTML='<div class="empty">The Project Narrative is not available for this account.</div>';return;}
    var h='<h2>📄 Project Narrative & Statement of Work'+(d.doc&&d.doc.revision?' <span style="font-weight:600;color:#1d4ed8">· '+esc(d.doc.revision)+'</span>':'')+'</h2>';
    if(d.doc){
     h+='<div class="bar" style="align-items:center">';
@@ -4419,19 +4464,28 @@ ALERTS_JS = r"""/* ============================================================
   var box=document.getElementById('narr-users');
   try{
    var d=await (await fetch('/api/narrative/users',{cache:'no-store'})).json();
-   box.innerHTML=(d.users||[]).map(function(u){
-    return '<label style="display:block;margin-top:3px"><input type="checkbox" '+(u.can_download?'checked':'')+(u.admin?' disabled':'')+
-     ' onchange="setDl('+u.id+',this.checked)"> '+esc(u.email)+(u.admin?' <span class="muted">(administrator)</span>':'')+'</label>';
-   }).join('')||'No users.';
+   var rows=(d.users||[]).map(function(u){
+    var dis=u.admin?' disabled':'';
+    return '<tr><td style="padding:3px 10px 3px 0">'+esc(u.email)+(u.admin?' <span class="muted">(administrator)</span>':'')+'</td>'+
+     '<td style="text-align:center">'+(u.admin?'':'<button style="font-size:11px;padding:2px 8px" onclick="setNarr('+u.id+',false)">Remove</button>')+'</td>'+
+     '<td style="text-align:center"><input type="checkbox" id="dl'+u.id+'" '+(u.can_download?'checked':'')+dis+(u.blocked?' disabled':'')+' onchange="setDl('+u.id+',this.checked)"></td></tr>';
+   }).join('');
+   box.innerHTML=rows?'<table style="border-collapse:collapse;font-size:13px;margin-top:4px"><tr style="font-weight:700"><td style="padding-right:10px">User</td><td style="padding:0 10px">Remove from Narrative</td><td style="padding:0 10px">Can download</td></tr>'+rows+'</table>':'No users.';
   }catch(e){box.textContent='Could not load users.';}
  }
  window.setDl=async function(id,on){
   await fetch('/api/narrative/permission',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:id,on:on})});
  };
+ window.setNarr=async function(id,see){
+  await fetch('/api/narrative/permission',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:id,field:'blocked',on:!see})});
+  loadUsers();
+ };
  async function refreshRevLine(){
   try{
    var d=await (await fetch('/api/narrative',{cache:'no-store'})).json();
    var el=document.getElementById('narrrev');
+   var tb=document.getElementById('tab-narr'); if(tb)tb.style.display=d.blocked?'none':'';
+   if(d.blocked){if(el)el.innerHTML='';var v=document.getElementById('view-narr');if(v&&v.style.display==='block'&&typeof showTab==='function')showTab('watch');return;}
    if(el)el.innerHTML=(d.doc&&d.doc.revision)?'Project Narrative: <a href="#" onclick="showTab(\'narr\');return false">'+esc(d.doc.revision)+'</a>':'';
   }catch(e){}
  }
@@ -5872,6 +5926,9 @@ class Handler(BaseHTTPRequestHandler):
             uid = self._uid()
             if not uid:
                 return self._json({"logged_in": False})
+            if narr_blocked(uid):
+                return self._json({"logged_in": True, "blocked": True, "doc": None,
+                                   "is_admin": False, "can_download": False})
             doc = narrative_latest()
             self._json({"logged_in": True, "doc": doc, "is_admin": is_admin(uid),
                         "can_download": can_download(uid)})
@@ -6101,7 +6158,10 @@ class Handler(BaseHTTPRequestHandler):
                 target = int(body.get("user_id"))
             except Exception:
                 return self._json({"error": "Bad user."})
-            set_can_download(target, bool(body.get("on")))
+            if body.get("field") == "blocked":
+                set_narr_blocked(target, bool(body.get("on")))
+            else:
+                set_can_download(target, bool(body.get("on")))
             return self._json({"ok": True})
         elif self.path.startswith("/api/prefs/channels"):
             uid = self._uid()
