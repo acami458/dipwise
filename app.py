@@ -3051,6 +3051,688 @@ def refresher():
 
 
 
+# ========================= MORNING REPORT =========================
+# JT My Portfolio — Pre-Market Price Report (☀️ Morning tab).
+# Built automatically every trading day at MORNING_TIME_ET (Eastern), shown on
+# the website, and downloadable as an .xlsx in the JT template layout
+# ("Entry Analysis" + "Source Audit" sheets, colour legend, dated title).
+#
+#   Last close : Alpaca SIP daily bar (official consolidated close).
+#   Pre-market : Alpaca SIP 1-minute bars since 4:00 ET. The free Alpaca plan
+#                serves SIP data with a 15-minute delay, so a 5:30 run shows the
+#                last pre-market trade up to ~5:15 ET. Falls back to the live
+#                IEX trade (IEX itself only trades pre-market from 8:00 ET).
+#   News / ex-div / earnings : Claude with web search, a few tickers per call,
+#                once per day. Finnhub supplies the earnings-date hint/fallback.
+#
+#   export MORNING_TIME_ET="05:30"   (24h, US Eastern; trading days only)
+#   export MORNING_AI=1              (0 = prices only, no Claude cost)
+#   export MORNING_KEY=<random>      (optional: outside cron can hit
+#                                     /api/morning/cron?key=... to wake the server)
+MORNING_TIME_ET  = os.environ.get("MORNING_TIME_ET", "05:30").strip()
+MORNING_AI       = os.environ.get("MORNING_AI", "1").lower() not in ("0", "false", "no", "off")
+MORNING_KEY      = os.environ.get("MORNING_KEY", "").strip()
+MORNING_TIMEOUT  = int(os.environ.get("MORNING_TIMEOUT", "300"))   # per Claude batch
+MORNING_BATCH    = int(os.environ.get("MORNING_BATCH", "7"))       # tickers per Claude call
+MORNING_MAX      = 60                                              # portfolio size cap
+MORNING_TITLE    = "JT My Portfolio — Pre-Market Price Report"
+
+# The JT template list (Nov 2026). Seeded into the DB the first time the
+# Morning tab is used; edit it from the tab afterwards.
+MORNING_DEFAULT = [
+    ("AAPL", "Apple Inc."), ("AMZN", "Amazon.com Inc."), ("BA", "Boeing Co."),
+    ("CL", "Colgate-Palmolive Co."), ("DD", "DuPont de Nemours Inc."), ("GE", "GE Aerospace"),
+    ("GEV", "GE Vernova Inc."), ("GLD", "SPDR Gold Shares (ETF)"), ("GOOG", "Alphabet Inc."),
+    ("JNJ", "Johnson & Johnson"), ("JPM", "JPMorgan Chase & Co."), ("KO", "Coca-Cola Co."),
+    ("LLY", "Eli Lilly and Company"), ("LMT", "Lockheed Martin Corp."), ("MA", "Mastercard Inc."),
+    ("MPC", "Marathon Petroleum Corp."), ("MRK", "Merck & Co. Inc."), ("MSFT", "Microsoft Corp."),
+    ("NVDA", "NVIDIA Corp."), ("RIO", "Rio Tinto Group"), ("SPCX", "SpaceX"),
+    ("TJX", "The TJX Companies, Inc."), ("TSLA", "Tesla Inc."), ("WMT", "Walmart Inc."),
+    ("WWD", "Woodward Inc."),
+]
+
+_morning_lock = threading.Lock()
+_morning_state = {"running": False, "step": "", "error": "", "started": None}
+_morning_tables_ok = False
+_ALPACA_BARS_URL = "https://data.alpaca.markets/v2/stocks/bars"
+
+
+def _morning_ensure_tables():
+    """Create the Morning tables on first use (independent of init_db)."""
+    global _morning_tables_ok
+    if _morning_tables_ok:
+        return
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS morning_portfolio(
+            symbol TEXT PRIMARY KEY, name TEXT)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS morning_reports(
+            day TEXT PRIMARY KEY, data_json TEXT NOT NULL, updated_at TEXT)""")
+        conn.commit()
+        _morning_tables_ok = True
+    finally:
+        conn.close()
+
+
+def _morning_time():
+    try:
+        h, m = MORNING_TIME_ET.split(":")
+        return int(h), int(m)
+    except Exception:
+        return 5, 30
+
+
+def _morning_seeded(cur):
+    cur.execute("SELECT 1 FROM morning_reports WHERE day='__seeded__'")
+    return cur.fetchone() is not None
+
+
+def morning_get_portfolio():
+    """[(symbol, name)] sorted by symbol. Seeds the template list on first use."""
+    _morning_ensure_tables()
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT symbol, name FROM morning_portfolio ORDER BY symbol")
+        rows = cur.fetchall()
+        if not rows and not _morning_seeded(cur):
+            for s, n in MORNING_DEFAULT:
+                cur.execute(_ph("INSERT INTO morning_portfolio(symbol, name) VALUES(%s,%s)", kind), (s, n))
+            cur.execute(_ph("INSERT INTO morning_reports(day, data_json, updated_at) VALUES(%s,%s,%s)", kind),
+                        ("__seeded__", "{}", datetime.now(timezone.utc).isoformat()))
+            conn.commit()
+            rows = sorted(MORNING_DEFAULT)
+        return [(r[0], r[1] or "") for r in rows]
+    finally:
+        conn.close()
+
+
+def _company_name(sym):
+    if not HAVE_EARNINGS:
+        return ""
+    try:
+        p = _finnhub_get("/stock/profile2", {"symbol": sym}) or {}
+        return (p.get("name") or "").strip()
+    except Exception:
+        return ""
+
+
+def morning_add(sym, name=""):
+    port = morning_get_portfolio()
+    if any(s == sym for s, _ in port):
+        return True, ""
+    if len(port) >= MORNING_MAX:
+        return False, f"Portfolio limit is {MORNING_MAX}."
+    name = (name or "").strip()[:80] or _company_name(sym)
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("INSERT INTO morning_portfolio(symbol, name) VALUES(%s,%s)", kind), (sym, name))
+        conn.commit()
+    finally:
+        conn.close()
+    return True, ""
+
+
+def morning_remove(sym):
+    _morning_ensure_tables()
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("DELETE FROM morning_portfolio WHERE symbol=%s", kind), (sym,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def morning_report_get(day):
+    _morning_ensure_tables()
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT data_json FROM morning_reports WHERE day=%s", kind), (day,))
+        row = cur.fetchone()
+        return json.loads(row[0]) if row else None
+    finally:
+        conn.close()
+
+
+def morning_report_days(limit=20):
+    _morning_ensure_tables()
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(_ph("SELECT day FROM morning_reports WHERE day<>'__seeded__' "
+                        "ORDER BY day DESC LIMIT %s", kind), (limit,))
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def morning_report_put(day, data):
+    _morning_ensure_tables()
+    conn, kind = _db()
+    try:
+        cur = conn.cursor()
+        now = datetime.now(timezone.utc).isoformat()
+        payload = json.dumps(data)
+        if kind == "pg":
+            cur.execute("""INSERT INTO morning_reports(day, data_json, updated_at) VALUES(%s,%s,%s)
+                           ON CONFLICT (day) DO UPDATE SET data_json=EXCLUDED.data_json,
+                           updated_at=EXCLUDED.updated_at""", (day, payload, now))
+        else:
+            cur.execute("INSERT OR REPLACE INTO morning_reports(day, data_json, updated_at) VALUES(?,?,?)",
+                        (day, payload, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _alpaca_ts(ts):
+    """Alpaca RFC3339 timestamp -> aware ET datetime, or None."""
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(str(ts)[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).astimezone(ET)
+    except Exception:
+        return None
+
+
+def _alpaca_bars(symbols, timeframe, start, end, feed):
+    """Multi-symbol bars {sym: [bar, ...]} (paginated). Raises on HTTP errors."""
+    headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET,
+               "User-Agent": "dipwise"}
+    out = {}
+    for chunk in _chunks(sorted(set(symbols)), 90):
+        page_token = None
+        for _ in range(40):
+            params = {"symbols": ",".join(chunk), "timeframe": timeframe, "start": start,
+                      "end": end, "feed": feed, "limit": "10000", "adjustment": "raw"}
+            if page_token:
+                params["page_token"] = page_token
+            req = urllib.request.Request(_ALPACA_BARS_URL + "?" + urllib.parse.urlencode(params),
+                                         headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read().decode())
+            for s, lst in (data.get("bars") or {}).items():
+                out.setdefault(s, []).extend(lst)
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+    return out
+
+
+def _utc_iso(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def morning_prices(symbols, now):
+    """{sym: {close, close_day, close_src, pre, pre_time, pre_src}}.
+
+    Last close = most recent completed regular session before today (SIP daily
+    bar, else the IEX snapshot). Pre-market = last trade today between 4:00 and
+    9:30 ET (SIP 1-min bars, 15-min delayed on the free plan, else IEX)."""
+    today = now.date()
+    out = {s: {"close": None, "close_day": "", "close_src": "",
+               "pre": None, "pre_time": "", "pre_src": ""} for s in symbols}
+    if not HAVE_DATA or not symbols:
+        return out
+
+    # 1) Last close — SIP daily bars.
+    try:
+        daily = _alpaca_bars(symbols, "1Day", (today - timedelta(days=12)).isoformat(),
+                             _utc_iso(now - timedelta(minutes=16)), "sip")
+    except Exception as e:
+        print(f"[MORNING] SIP daily bars failed: {str(e)[:160]}", flush=True)
+        daily = {}
+    for s, lst in daily.items():
+        done = [b for b in lst if (_alpaca_ts(b.get("t")) or now).date() < today and b.get("c")]
+        if s in out and done:
+            b = max(done, key=lambda b: str(b.get("t")))
+            out[s].update(close=round(b["c"], 2), close_day=_alpaca_ts(b["t"]).date().isoformat(),
+                          close_src="Alpaca SIP daily bar (consolidated close)")
+
+    # 2) Pre-market — SIP minute bars since 4:00 ET, 16 min behind now.
+    pm_start = now.replace(hour=4, minute=0, second=0, microsecond=0)
+    pm_end = min(now - timedelta(minutes=16), now.replace(hour=9, minute=29, second=59, microsecond=0))
+    if pm_end > pm_start:
+        try:
+            mins = _alpaca_bars(symbols, "1Min", _utc_iso(pm_start), _utc_iso(pm_end), "sip")
+        except Exception as e:
+            print(f"[MORNING] SIP minute bars failed: {str(e)[:160]}", flush=True)
+            mins = {}
+        for s, lst in mins.items():
+            lst = [b for b in lst if b.get("c")]
+            if s in out and lst:
+                b = max(lst, key=lambda b: str(b.get("t")))
+                t = _alpaca_ts(b["t"]) + timedelta(minutes=1)      # bar end = last trade minute
+                out[s].update(pre=round(b["c"], 2), pre_time=t.strftime("%H:%M ET"),
+                              pre_src=f"Alpaca SIP 1-min bar, last pre-market trade ~{t.strftime('%H:%M')} ET (15-min delayed)")
+
+    # 3) Fallbacks from the live IEX snapshot.
+    need = [s for s in symbols if out[s]["close"] is None or out[s]["pre"] is None]
+    if need:
+        try:
+            snaps = fetch_snapshots(need)
+        except Exception:
+            snaps = {}
+        for s in need:
+            sn = snaps.get(s) or {}
+            db, pdb, lt = sn.get("dailyBar") or {}, sn.get("prevDailyBar") or {}, sn.get("latestTrade") or {}
+            if out[s]["close"] is None:
+                bar = pdb if (_alpaca_ts(db.get("t")) or now).date() == today else db
+                if bar.get("c"):
+                    out[s].update(close=round(bar["c"], 2),
+                                  close_day=(_alpaca_ts(bar.get("t")) or now).date().isoformat(),
+                                  close_src=f"Alpaca {ALPACA_FEED.upper()} snapshot daily bar")
+            if out[s]["pre"] is None and lt.get("p"):
+                t = _alpaca_ts(lt.get("t"))
+                if t and t.date() == today and t.hour * 60 + t.minute < 9 * 60 + 30:
+                    out[s].update(pre=round(lt["p"], 2), pre_time=t.strftime("%H:%M ET"),
+                                  pre_src=f"Alpaca {ALPACA_FEED.upper()} latest trade {t.strftime('%H:%M')} ET")
+    return out
+
+
+def _morning_finnhub_earnings(symbols, today):
+    """{sym: "YYYY-MM-DD (bmo|amc)"} next earnings from Finnhub (hint for Claude + fallback)."""
+    if not HAVE_EARNINGS:
+        return {}
+    want, out = set(symbols), {}
+    # Finnhub's free tier truncates long ranges, so walk it in 2-week windows.
+    for k in range(0, 98, 14):
+        a, b = today + timedelta(days=k), today + timedelta(days=k + 13)
+        try:
+            rows = fetch_earnings_calendar(a.isoformat(), b.isoformat()) or []
+        except Exception:
+            continue
+        for r in sorted(rows, key=lambda r: r.get("date") or ""):
+            s = (r.get("symbol") or "").upper()
+            if s in want and s not in out and r.get("date"):
+                out[s] = r["date"] + (f" ({r['hour']})" if r.get("hour") else "")
+        if want <= set(out):
+            break
+    return out
+
+
+MORNING_PROMPT = """You are preparing the "News / Alerts / Risks", "Ex-dividend Date" and "Earnings Date"
+columns of a pre-market portfolio report for a retired investor. Today is {today_long}
+(US Eastern, before the market opens). Use web search to check CURRENT information.
+
+Tickers (with company name, last close and Finnhub's next-earnings hint, which may be an estimate):
+{lines}
+
+For EACH ticker return:
+- "name": short company name (e.g. "Apple Inc."). If the ticker is not publicly traded or
+  you cannot find it, say so in "news" and set "level" to "na".
+- "news": ONE line, max ~220 characters. The most decision-relevant items from the last
+  ~3 trading days: analyst rating/price-target changes, company news, legal/regulatory,
+  macro hits specific to the name, scheduled events today/tomorrow. Put the date of each
+  item in parentheses, e.g. "(Nov 10)". Prefix "⚠ " when it is a real risk to the stock;
+  use "TODAY"/"TOMORROW" in caps for imminent binary events. If nothing new in 3 days,
+  give the most relevant recent item WITH its date. Never repeat old news as if new.
+  Be precise with numbers: if a figure is a total across several companies, say so.
+- "level": "high" (major mover / must-read this morning), "risk" (⚠ item), "normal", or "na".
+- "exdiv": the next ex-dividend date with the per-payment amount, e.g. "Nov 20 ($0.53)".
+  If declared, give it as is. If not yet declared but the regular pattern puts it within
+  the next ~60 days, give "~Nov 18 (est. $1.00)". Otherwise "—". ETFs with no
+  distribution: "— (ETF)". No dividend at all: "—".
+- "earnings": next earnings release, e.g. "Jan 29, 2027". Append " (est.)" unless the
+  company has officially confirmed the date.
+
+Return ONLY a JSON object, no markdown fences, no commentary:
+{{"rows": [{{"ticker": "AAPL", "name": "...", "news": "...", "level": "normal",
+  "exdiv": "—", "earnings": "Jan 29, 2027 (est.)"}}, ...]}}
+Include every ticker listed above exactly once."""
+
+
+def _morning_claude_batch(batch, names, prices, hints, today):
+    lines = "\n".join(
+        f"- {s} ({names.get(s) or 'name unknown'}) | last close "
+        f"{('$%.2f' % prices[s]['close']) if prices.get(s, {}).get('close') else 'n/a'}"
+        f" | earnings hint: {hints.get(s, 'unknown')}" for s in batch)
+    prompt = MORNING_PROMPT.format(today_long=today.strftime("%A, %B %d, %Y"), lines=lines)
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 4000,
+        "messages": [{"role": "user", "content": prompt}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search",
+                   "max_uses": max(4, len(batch) * 2)}],
+    }
+    req = urllib.request.Request(
+        ANTHROPIC_URL, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY,
+                 "anthropic-version": ANTHROPIC_VERSION})
+    try:
+        with urllib.request.urlopen(req, timeout=MORNING_TIMEOUT) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Anthropic API {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}")
+    text = "\n".join(b.get("text", "") for b in (raw.get("content") or [])
+                     if isinstance(b, dict) and b.get("type") == "text")
+    data = _extract_json(text) or {}
+    out = {}
+    for r in data.get("rows") or []:
+        s = (r.get("ticker") or "").upper().strip()
+        if s in batch:
+            lvl = (r.get("level") or "normal").lower()
+            out[s] = {"name": (r.get("name") or "").strip()[:60],
+                      "news": (r.get("news") or "").strip()[:400],
+                      "level": lvl if lvl in ("high", "risk", "normal", "na") else "normal",
+                      "exdiv": (r.get("exdiv") or "—").strip()[:60],
+                      "earnings": (r.get("earnings") or "").strip()[:60]}
+    return out
+
+
+def morning_ai_columns(symbols, names, prices, today):
+    """Claude over the portfolio in parallel batches. Returns ({sym: cols}, [errors])."""
+    hints = _morning_finnhub_earnings(symbols, today)
+    batches = [symbols[i:i + MORNING_BATCH] for i in range(0, len(symbols), MORNING_BATCH)]
+    cols, errors = {}, []
+
+    def run(b):
+        for attempt in (1, 2):
+            try:
+                return _morning_claude_batch(b, names, prices, hints, today)
+            except Exception as e:
+                if attempt == 2:
+                    errors.append(f"{b[0]}–{b[-1]}: {str(e)[:160]}")
+                time.sleep(5)
+        return {}
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        for res in ex.map(run, batches):
+            cols.update(res)
+    for s in symbols:   # Finnhub earnings date for anything Claude missed
+        if s in hints and not (cols.get(s) or {}).get("earnings"):
+            try:
+                d = datetime.strptime(hints[s].split(" ")[0], "%Y-%m-%d")
+                cols.setdefault(s, {})["earnings"] = d.strftime("%b %-d, %Y") + " (est.)"
+            except Exception:
+                pass
+    return cols, errors
+
+
+def _morning_status(r):
+    """Colour-legend status for a row: up | down | caution | na."""
+    if r.get("pre") is None or not r.get("close"):
+        return "na"
+    if r.get("level") in ("risk", "high") or str(r.get("news") or "").startswith("⚠"):
+        return "caution"
+    return "up" if r["pre"] >= r["close"] else "down"
+
+
+def build_morning_report(use_ai=True):
+    """Build (or rebuild) today's report. With use_ai=False the Claude columns
+    are reused from today's existing report, so only prices are refreshed."""
+    now = datetime.now(ET)
+    today = now.date()
+    day = today.isoformat()
+    _morning_state["step"] = "Loading portfolio…"
+    port = morning_get_portfolio()
+    symbols = [s for s, _ in port]
+    names = dict(port)
+    _morning_state["step"] = "Fetching prices from Alpaca…"
+    prices = morning_prices(symbols, now)
+    prior = morning_report_get(day) or {}
+    prior_cols = {r["ticker"]: r for r in prior.get("rows", [])}
+    errors = []
+    if use_ai and MORNING_AI and HAVE_SIMUCAL:
+        _morning_state["step"] = f"Claude is researching news for {len(symbols)} stocks (2–4 min)…"
+        cols, errors = morning_ai_columns(symbols, names, prices, today)
+        ai_at = now.strftime("%H:%M ET")
+    else:
+        cols = {s: {k: prior_cols[s].get(k) for k in ("news", "level", "exdiv", "earnings")}
+                for s in symbols if s in prior_cols}
+        ai_at = prior.get("ai_at", "")
+    rows = []
+    for s in symbols:
+        p, c = prices.get(s, {}), cols.get(s, {})
+        name = names.get(s) or c.get("name") or ""
+        if not names.get(s) and c.get("name"):
+            try:
+                conn, kind = _db(); cur = conn.cursor()
+                cur.execute(_ph("UPDATE morning_portfolio SET name=%s WHERE symbol=%s", kind), (c["name"], s))
+                conn.commit(); conn.close()
+            except Exception:
+                pass
+        pre, close = p.get("pre"), p.get("close")
+        r = {"ticker": s, "name": name, "close": close, "close_day": p.get("close_day", ""),
+             "close_src": p.get("close_src", ""), "pre": pre, "pre_time": p.get("pre_time", ""),
+             "pre_src": p.get("pre_src", ""),
+             "chg": round((pre / close - 1) * 100, 2) if (pre is not None and close) else None,
+             "news": c.get("news") or "", "level": c.get("level") or "normal",
+             "exdiv": c.get("exdiv") or "—", "earnings": c.get("earnings") or ""}
+        r["status"] = _morning_status(r)
+        rows.append(r)
+    close_days = sorted({r["close_day"] for r in rows if r["close_day"]})
+    report = {"day": day, "built_at": now.strftime("%H:%M ET"), "ai_at": ai_at,
+              "close_day": close_days[-1] if close_days else "", "rows": rows,
+              "errors": errors, "scheduled_done": prior.get("scheduled_done", False)}
+    morning_report_put(day, report)
+    return report
+
+
+def _morning_filename(day):
+    return f"JT_Portfolio_PreMarket_{day}.xlsx"
+
+
+def morning_build_xlsx(report):
+    """Workbook in the JT template layout: Entry Analysis + Source Audit."""
+    import io
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    d = datetime.strptime(report["day"], "%Y-%m-%d")
+    cd = report.get("close_day")
+    cdd = datetime.strptime(cd, "%Y-%m-%d") if cd else None
+    fill = lambda c: PatternFill("solid", fgColor=c)
+    thin, med = Side(style="thin", color="FF000000"), Side(style="medium", color="FF000000")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    NAVY, F = "FF17365D", "Calibri"
+    LEG = {"up": ("FFC6EFCE", "FF276221"), "down": ("FFFFC7CE", "FF9C0006"),
+           "caution": ("FFFFEB9C", "FF9C5700"), "na": ("FFD9D9D9", "FF595959")}
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Entry Analysis"
+    ws.merge_cells("A1:H1"); ws.merge_cells("A2:H2")
+    ws["A1"] = f"{MORNING_TITLE} | {d.strftime('%A, %B %-d, %Y')}"
+    ws["A1"].font = Font(name=F, size=14, bold=True, color="FFFFFFFF")
+    ws["A1"].fill = fill(NAVY); ws["A1"].alignment = center
+    ws["A2"] = (f"As-of {report.get('built_at', '')} | Last Close: "
+                f"{cdd.strftime('%a %b %-d, %Y') if cdd else 'N/A'} | Pre-Market: "
+                f"{d.strftime('%a %b %-d, %Y')} | USD")
+    ws["A2"].font = Font(name=F, size=10, italic=True)
+    ws["A2"].fill = fill("FFD9D9D9"); ws["A2"].alignment = center
+    hdr = ["Ticker", "Company Name", "Last Close", "Pre-Market", "Chg %",
+           "News / Alerts /Risks", "Ex-dividend Date", "Earnings Date"]
+    for i, h in enumerate(hdr, 1):
+        c = ws.cell(3, i, h)
+        c.font = Font(name=F, size=11, bold=True, color="FFFFFFFF")
+        c.fill = fill(NAVY); c.border = box
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for rr, hgt in ((1, 19), (2, 18), (3, 18)):
+        ws.row_dimensions[rr].height = hgt
+
+    rows = report["rows"]
+    for i, r in enumerate(rows):
+        row = 4 + i
+        st = r.get("status") or _morning_status(r)
+        bg, fg = LEG[st]
+        chg = r.get("chg")
+        vals = [r["ticker"], r.get("name") or "",
+                r.get("close") if r.get("close") is not None else "N/A",
+                r.get("pre") if r.get("pre") is not None else "N/A",
+                (chg / 100.0) if chg is not None else "N/A",
+                r.get("news") or "", r.get("exdiv") or "—", r.get("earnings") or "—"]
+        for j, v in enumerate(vals, 1):
+            c = ws.cell(row, j, v)
+            c.border = box
+            c.font = Font(name=F, size=11, bold=(j == 1))
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=(j in (6, 7, 8)))
+        ws.cell(row, 1).border = Border(left=med, right=thin, top=thin, bottom=thin)
+        ws.cell(row, 2).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws.cell(row, 6).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        for j in (3, 4):
+            if isinstance(ws.cell(row, j).value, (int, float)):
+                ws.cell(row, j).number_format = "$#,##0.00"
+        if chg is not None:
+            ws.cell(row, 5).number_format = "+0.00%;-0.00%;0.00%"
+        # Status colour on the ticker and the three price cells.
+        for j in (1, 3, 4, 5):
+            c = ws.cell(row, j)
+            c.fill = fill(bg)
+            c.font = Font(name=F, size=11, bold=(j in (1, 5)), color=fg)
+        if st == "caution":
+            ws.cell(row, 6).fill = fill(LEG["caution"][0])
+        if st == "na":
+            ws.cell(row, 2).fill = fill(LEG["na"][0])
+        ex = str(r.get("exdiv") or "")
+        if ex and not ex.startswith("—"):
+            ws.cell(row, 7).font = Font(name=F, size=11, bold=True, italic="est" in ex)
+        lines = max(1, -(-len(str(r.get("news") or "")) // 80))
+        ws.row_dimensions[row].height = max(18, 15 * lines + 3)
+
+    leg = 4 + len(rows)
+    ws.merge_cells(start_row=leg, start_column=1, end_row=leg, end_column=8)
+    c = ws.cell(leg, 1, "COLOR LEGEND — Green positive | Red negative | Yellow caution | Gray N/A")
+    c.font = Font(name=F, size=8, italic=True, color="FF595959"); c.alignment = center
+    ws.row_dimensions[leg].height = 24
+    sw = leg + 1
+    for j, (lbl, st) in enumerate((("Positive", "up"), ("Negative", "down"),
+                                   ("Caution", "caution"), ("N/A", "na")), 1):
+        c = ws.cell(sw, j * 2 - 1, lbl)
+        c.fill = fill(LEG[st][0]); c.font = Font(name=F, size=9, bold=True, color=LEG[st][1])
+        c.alignment = center; c.border = box
+    note = ws.cell(sw + 1, 1,
+                   "Prices: Alpaca SIP (free plan = 15-min delayed); N/A = no pre-market trade yet. "
+                   "News, ex-dividend and earnings dates researched by Claude with web search"
+                   + (f" at {report['ai_at']}" if report.get("ai_at") else "")
+                   + "; \"est.\" = projected, not confirmed by the company. Not investment advice.")
+    ws.merge_cells(start_row=sw + 1, start_column=1, end_row=sw + 1, end_column=8)
+    note.font = Font(name=F, size=8, italic=True, color="FF595959")
+    note.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[sw + 1].height = 30
+
+    for col, w in zip("ABCDEFGH", [10, 24, 13, 13, 10, 77, 17, 17]):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "C4"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    sa = wb.create_sheet("Source Audit")
+    dl = d.strftime("%b %-d")
+    sa_hdr = ["Ticker", f"{cdd.strftime('%b %-d') if cdd else 'Last'} close source",
+              f"{dl} pre-market source", "News / dates source"]
+    for i, h in enumerate(sa_hdr, 1):
+        c = sa.cell(1, i, h)
+        c.font = Font(name=F, size=11, bold=True, color="FFFFFFFF"); c.fill = fill("FF12304A")
+    for i, r in enumerate(rows, 2):
+        sa.cell(i, 1, r["ticker"]).font = Font(name=F, size=11, bold=True)
+        sa.cell(i, 2, r.get("close_src") or "N/A")
+        sa.cell(i, 3, r.get("pre_src") or "N/A — no pre-market trade found")
+        sa.cell(i, 4, ("Claude web search " + report["ai_at"]) if (report.get("ai_at") and r.get("news")) else "N/A")
+    for col, w in zip("ABCD", [13, 48, 66, 30]):
+        sa.column_dimensions[col].width = w
+    sa.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def morning_run(use_ai=True):
+    """Build in the caller's thread. One run at a time."""
+    if not _morning_lock.acquire(blocking=False):
+        return None
+    _morning_state.update(running=True, error="", step="Starting…",
+                          started=datetime.now(ET).strftime("%H:%M ET"))
+    try:
+        return build_morning_report(use_ai=use_ai)
+    except Exception as e:
+        _morning_state["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        print(f"[MORNING] build failed: {e}", flush=True)
+        return None
+    finally:
+        _morning_state.update(running=False, step="")
+        _morning_lock.release()
+
+
+def morning_run_async(use_ai=True):
+    if _morning_state["running"]:
+        return False
+    threading.Thread(target=morning_run, args=(use_ai,), daemon=True).start()
+    return True
+
+
+_trading_day_cache = {}
+
+
+def _is_trading_day(d):
+    """Weekday + not an exchange holiday (Alpaca calendar; assumes open if the check fails)."""
+    if d.weekday() >= 5:
+        return False
+    if d in _trading_day_cache:
+        return _trading_day_cache[d]
+    if not HAVE_DATA:
+        return True
+    try:
+        url = f"https://paper-api.alpaca.markets/v2/calendar?start={d.isoformat()}&end={d.isoformat()}"
+        req = urllib.request.Request(url, headers={"APCA-API-KEY-ID": ALPACA_KEY,
+                                                   "APCA-API-SECRET-KEY": ALPACA_SECRET})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            cal = json.loads(r.read().decode())
+        ok = any((c.get("date") or "") == d.isoformat() for c in cal)
+        _trading_day_cache[d] = ok
+        return ok
+    except Exception:
+        return True
+
+
+def morning_due_job():
+    """If it's past MORNING_TIME_ET on a trading day and today's scheduled run
+    hasn't happened, build it. Returns True if it ran (or nothing to do)."""
+    now = datetime.now(ET)
+    if (now.hour, now.minute) < _morning_time():
+        return False
+    today = now.date()
+    if not _is_trading_day(today):
+        return True
+    rep = morning_report_get(today.isoformat())
+    if rep and rep.get("scheduled_done"):
+        return True
+    report = morning_run(use_ai=True)
+    if report:
+        report["scheduled_done"] = True
+        morning_report_put(report["day"], report)
+        return True
+    return False
+
+
+def morning_scheduler():
+    """Background loop: once a minute, but only touches the DB after the
+    scheduled time and until today's run is done (keeps Neon idle)."""
+    done_day, fails = None, 0
+    while True:
+        try:
+            now = datetime.now(ET)
+            today = now.date()
+            if done_day != today and (now.hour, now.minute) >= _morning_time() and now.hour < 12 and fails < 3:
+                if morning_due_job():
+                    done_day, fails = today, 0
+                elif not _morning_state["running"]:
+                    fails += 1
+            if done_day != today and now.hour >= 12:
+                done_day, fails = today, 0       # give up for today; reset for tomorrow
+        except Exception as e:
+            print(f"[MORNING] scheduler error: {e}", flush=True)
+            fails += 1
+        time.sleep(60)
+
+
 def meta():
     now = datetime.now(ET)
     return {"as_of": now.strftime("%a %b %d, %H:%M:%S ET"),
@@ -4216,6 +4898,121 @@ def icon_bytes():
         return _FALLBACK_ICON
 
 
+MORNING_JS = r"""/* ============================================================
+   ☀️ Morning tab — JT My Portfolio pre-market report.
+   Server builds it at MORNING_TIME_ET on trading days; this view shows it,
+   lets you rebuild / download it, and edit the ticker list.
+   ============================================================ */
+(function(){
+ var M = {data:null, day:'', poll:null};
+ function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+ function $(id){return document.getElementById(id);}
+ function fmt(v){return (v===null||v===undefined)?'N/A':'$'+Number(v).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
+ function dt(iso){var p=iso.split('-');return new Date(+p[0],+p[1]-1,+p[2]);}
+ function longDay(iso){return iso?dt(iso).toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'}):'';}
+ function shortDay(iso){return iso?dt(iso).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'}):'';}
+ function msg(t,ok){var m=$('mo-msg');if(!m)return;m.style.color=ok?'#047857':'#b91c1c';m.textContent=t||'';if(t)setTimeout(function(){if(m.textContent===t)m.textContent='';},6000);}
+
+ async function load(day){
+  var url='/api/morning'+(day?('?day='+encodeURIComponent(day)):'');
+  try{
+   var d=await (await fetch(url,{cache:'no-store'})).json();
+   M.data=d; render();
+   if(d.state&&d.state.running){startPoll();}else{stopPoll();}
+  }catch(e){stopPoll();$('mo-root').innerHTML='<div class="warn">Could not load the morning report ('+esc(e&&e.message||e)+'). Try refreshing the page.</div>';}
+ }
+ function startPoll(){if(!M.poll)M.poll=setInterval(function(){load(M.day);},4000);}
+ function stopPoll(){if(M.poll){clearInterval(M.poll);M.poll=null;}}
+
+ function render(){
+  var d=M.data, root=$('mo-root');
+  if(!d.logged_in){root.innerHTML='<div class="empty">Sign in above to see the morning report.</div>';return;}
+  if(d.fatal){root.innerHTML='<div class="warn" style="background:#fef2f2;color:#991b1b;border-color:#fecaca">Server error loading the morning report: '+esc(d.fatal)+'</div>';return;}
+  M.day=d.day;
+  var r=d.report, st=d.state||{};
+  var opts=(d.days||[]).slice();
+  if(opts.indexOf(d.day)<0)opts.unshift(d.day);
+  var sel='<select id="mo-day" onchange="moLoad(this.value)">'+opts.map(function(x){return '<option value="'+x+'"'+(x===d.day?' selected':'')+'>'+shortDay(x)+(x===d.today?' (today)':'')+'</option>';}).join('')+'</select>';
+  var h='<div class="bar" style="align-items:center;margin-top:4px">'+sel;
+  h+='<button class="primary" onclick="moDownload()" '+(r?'':'disabled')+'>📥 Download Excel</button>';
+  if(d.day===d.today){
+   h+='<button onclick="moGen(false)" title="Re-pull prices only — keeps today\'s news (free)">🔄 Refresh prices</button>';
+   h+='<button onclick="moGen(true)" title="Re-run Claude for news, dividends and earnings (uses API credit)" '+(d.ai_on?'':'disabled')+'>✨ Rebuild with Claude</button>';
+  }
+  h+='<span id="mo-msg" style="font-size:12px"></span></div>';
+  if(st.running){h+='<div class="warn">⏳ '+esc(st.step||'Working…')+' <span class="muted">(started '+esc(st.started||'')+')</span></div>';}
+  else if(st.error){h+='<div class="warn" style="background:#fef2f2;color:#991b1b;border-color:#fecaca">Last run problem: '+esc(st.error)+'</div>';}
+  var info=[];
+  if(r){info.push('Built '+esc(r.built_at));if(r.ai_at)info.push('news by Claude at '+esc(r.ai_at));}
+  info.push('runs automatically '+esc(d.schedule));
+  if(!d.ai_on)info.push('<b>Claude is off</b> (needs ANTHROPIC_API_KEY, MORNING_AI≠0) — prices only');
+  h+='<div class="muted" style="font-size:12px;margin:2px 0 10px;color:#4b5563">'+info.join(' · ')+'</div>';
+  if(r&&r.errors&&r.errors.length){h+='<div class="warn">Some stocks are missing news: '+esc(r.errors.join(' | '))+'</div>';}
+  if(!r){
+   h+='<div class="empty" style="margin:18px 0">No report for '+esc(longDay(d.day))+' yet.'+(d.day===d.today?' It builds itself '+esc(d.schedule)+', or press <b>✨ Rebuild with Claude</b> to make it now (2–4 min).':'')+'</div>';
+  }else{h+=table(r);}
+  h+=portfolioEditor(d.portfolio||[]);
+  root.innerHTML=h;
+ }
+
+ function table(r){
+  var h='<div style="overflow:auto"><table class="motbl"><thead>';
+  h+='<tr><th colspan="8" class="mo-title">'+esc(M.data.title)+' | '+esc(longDay(r.day))+'</th></tr>';
+  h+='<tr><th colspan="8" class="mo-sub">As-of '+esc(r.built_at)+' | Last Close: '+esc(r.close_day?shortDay(r.close_day):'N/A')+' | Pre-Market: '+esc(shortDay(r.day))+' | USD</th></tr>';
+  h+='<tr><th>Ticker</th><th>Company Name</th><th>Last Close</th><th>Pre-Market</th><th>Chg %</th><th>News / Alerts / Risks</th><th>Ex-dividend Date</th><th>Earnings Date</th></tr></thead><tbody>';
+  r.rows.forEach(function(x){
+   var s='mo-'+(x.status||'na');
+   var chg=(x.chg===null||x.chg===undefined)?'N/A':((x.chg>=0?'+':'')+Number(x.chg).toFixed(2)+'%');
+   var ex=x.exdiv||'—';
+   h+='<tr><td class="mo-tk '+s+'">'+esc(x.ticker)+'</td><td'+(x.status==='na'?' class="mo-na"':'')+'>'+esc(x.name)+'</td>'+
+      '<td class="mo-num '+s+'">'+fmt(x.close)+'</td>'+
+      '<td class="mo-num '+s+'" title="'+esc(x.pre_time?('last pre-market trade ~'+x.pre_time):'no pre-market trade found')+'">'+fmt(x.pre)+'</td>'+
+      '<td class="mo-num mo-b '+s+'">'+chg+'</td>'+
+      '<td class="mo-news'+(x.status==='caution'?' mo-caution':'')+'">'+esc(x.news)+'</td>'+
+      '<td class="mo-c'+(ex.charAt(0)!=='—'?' mo-b'+(/est/.test(ex)?' mo-est':''):'')+'">'+esc(ex)+'</td>'+
+      '<td class="mo-c">'+esc(x.earnings||'—')+'</td></tr>';
+  });
+  h+='</tbody></table></div>';
+  h+='<div class="mo-legend"><b>COLOR LEGEND</b> <span class="mo-up">Green positive</span><span class="mo-down">Red negative</span><span class="mo-caution">Yellow caution</span><span class="mo-na">Gray N/A</span></div>';
+  h+='<div class="foot">Prices: Alpaca SIP (free plan = 15-min delayed) — N/A means no pre-market trade yet. Hover a pre-market price for its trade time. News, ex-dividend and earnings dates are researched by Claude with web search; <i>est.</i> = projected, not yet confirmed. Not investment advice.</div>';
+  return h;
+ }
+
+ function portfolioEditor(port){
+  var h='<details style="margin-top:16px"><summary style="cursor:pointer;font-weight:700">✏️ Edit tickers ('+port.length+')</summary>';
+  h+='<div class="bar addtop" style="margin-top:8px"><input id="mo-add" placeholder="Add a ticker (e.g. COST)" maxlength="10" style="flex:1;min-width:160px;text-transform:uppercase" onkeydown="if(event.key===\'Enter\')moAdd()"><button class="primary" onclick="moAdd()">Add</button></div>';
+  h+='<div style="display:flex;flex-wrap:wrap;gap:6px">'+port.map(function(p){
+   return '<span class="mo-chip" title="'+esc(p.name)+'">'+esc(p.symbol)+' <button onclick="moRemove(\''+esc(p.symbol)+'\')" title="Remove">×</button></span>';
+  }).join('')+'</div>';
+  h+='<div class="muted" style="font-size:12px;margin-top:6px;color:#4b5563">Changes apply to the next report. Press 🔄 Refresh prices to put a new ticker on today\'s report (its news fills in on the next Claude run).</div></details>';
+  return h;
+ }
+
+ window.moLoad=function(day){load(day);};
+ window.moDownload=function(){window.location='/api/morning/xlsx?day='+encodeURIComponent(M.day);};
+ window.moGen=async function(ai){
+  if(ai&&!confirm('Re-run Claude for all tickers? Takes 2–4 minutes and uses API credit.'))return;
+  var d=await (await fetch('/api/morning/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ai:ai})})).json();
+  if(d.error){msg(d.error);}
+  setTimeout(function(){load(M.data.today);},600);
+ };
+ window.moAdd=async function(){
+  var v=($('mo-add').value||'').trim().toUpperCase(); if(!v)return;
+  var d=await (await fetch('/api/morning/portfolio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',symbol:v})})).json();
+  if(d.error){msg(d.error);return;}
+  await load(M.day); var det=document.querySelector('#mo-root details'); if(det)det.open=true;
+ };
+ window.moRemove=async function(sym){
+  if(!confirm('Remove '+sym+' from the morning report?'))return;
+  await fetch('/api/morning/portfolio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',symbol:sym})});
+  await load(M.day); var det=document.querySelector('#mo-root details'); if(det)det.open=true;
+ };
+ window.initMorning=function(){load(M.day&&M.data&&M.day!==M.data.today?M.day:'');};
+ window.leaveMorning=function(){stopPoll();};
+})();
+"""
+
+
 # =========================== WEB PAGE ===========================
 ALERTS_JS = r"""/* ============================================================
    Alert architecture (intraday operation):
@@ -4593,6 +5390,23 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 .earn-badge{display:inline-block;margin-top:4px;font-size:10px;font-weight:800;padding:1px 6px;border-radius:999px;background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe}
 .earn-badge.soon{background:#fef3c7;color:#92400e;border-color:#fcd34d}
 .earn-badge.imm{background:#fee2e2;color:#991b1b;border-color:#fca5a5}
+/* ☀️ Morning report — JT template colours */
+.motbl{border-collapse:collapse;width:100%;font-size:13px;background:#fff;min-width:980px}
+.motbl th,.motbl td{border:1px solid #9ca3af;padding:6px 8px;vertical-align:middle}
+.motbl thead th{background:#17365d;color:#fff;font-weight:700;text-align:center;font-size:12px}
+.motbl thead th.mo-title{font-size:15px;padding:8px}
+.motbl thead th.mo-sub{background:#d9d9d9;color:#111827;font-weight:400;font-style:italic}
+.motbl .mo-tk{font-weight:800;text-align:center}
+.motbl td.mo-num{text-align:center;white-space:nowrap}.motbl .mo-b{font-weight:700}
+.motbl td.mo-news{min-width:340px;line-height:1.35}
+.motbl td.mo-c{text-align:center;white-space:nowrap}.motbl td.mo-est{font-style:italic}
+.mo-up{background:#c6efce !important;color:#276221}.mo-down{background:#ffc7ce !important;color:#9c0006}
+.mo-caution{background:#ffeb9c !important;color:#9c5700}.mo-na{background:#d9d9d9 !important;color:#595959}
+.motbl td.mo-news.mo-caution{color:#111827}.motbl td.mo-na:not(.mo-num):not(.mo-tk){color:#374151}
+.mo-legend{font-size:12px;margin:8px 0;display:flex;gap:6px;flex-wrap:wrap;align-items:center;color:#595959}
+.mo-legend span{padding:2px 8px;border-radius:4px;font-weight:700}
+.mo-chip{display:inline-flex;align-items:center;gap:2px;background:#fff;border:1px solid #d1d5db;border-radius:999px;padding:2px 4px 2px 10px;font-size:12px;font-weight:700}
+.mo-chip button{border:none;background:none;padding:0 6px;color:#9ca3af;font-size:14px}.mo-chip button:hover{color:#dc2626;background:none}
 </style></head><body>
 <h1>📈 Dipwise</h1>
 <div class="meta" id="asof">loading…</div>
@@ -4609,6 +5423,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <button id="tab-earn" class="tab" onclick="showTab('earn')">📅 Earnings</button>
   <button id="tab-simucal" class="tab" onclick="showTab('simucal')">🎯 SimuCal</button>
   <button id="tab-narr" class="tab" onclick="showTab('narr')">📄 Narrative</button>
+  <button id="tab-morning" class="tab" onclick="showTab('morning')">☀️ Morning</button>
 </div>
 
 <div id="view-watch">
@@ -4664,6 +5479,11 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
   <div id="narr-root"><div class="empty">Loading…</div></div>
 </div>
 
+<div id="view-morning" style="display:none">
+  <h2>☀️ Morning Report <span class="muted" style="font-weight:400;font-size:13px">· JT portfolio pre-market</span></h2>
+  <div id="mo-root"><div class="empty">Loading…</div></div>
+</div>
+
 <div id="view-simucal" style="display:none">
   <h2>🎯 SimuCal <span class="muted" style="font-weight:400;font-size:13px">· v5.0 anchored rubric</span></h2>
   <div class="bar" style="align-items:center;margin-top:8px">
@@ -4693,6 +5513,7 @@ input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid #d1d5db;bord
 </div>
 <script src="/sim.js"></script>
 <script src="/simucal.js"></script>
+<script src="/morning.js"></script>
 <script>
 let LAST={mine:[]}, ME={logged_in:false}, _chart=null, prevAlarmNum={}, firstLoad=true, _curTab='watch', _histChart=null;
 function pctSpan(v){if(v===null||v===undefined)return '<span class="muted">—</span>';var s=(v>=0?"+":"")+v.toFixed(2)+"%";return '<span class="'+(v>=0?'up':'dn')+'">'+s+'</span>';}
@@ -4966,6 +5787,9 @@ function showTab(t){
  document.getElementById('tab-simucal').classList.toggle('active',t==='simucal');
  document.getElementById('view-narr').style.display=(t==='narr')?'block':'none';
  document.getElementById('tab-narr').classList.toggle('active',t==='narr');
+ document.getElementById('view-morning').style.display=(t==='morning')?'block':'none';
+ document.getElementById('tab-morning').classList.toggle('active',t==='morning');
+ if(t==='morning'&&window.initMorning)window.initMorning(); else if(window.leaveMorning)window.leaveMorning();
  if(t==='narr'&&window.loadNarrative)window.loadNarrative();
  if(t==='history')loadHistory();
  if(t==='sim'&&window.initSim)window.initSim();
@@ -5881,6 +6705,45 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _morning_get(self):
+        uid = self._uid()
+        if not uid:
+            return self._json({"logged_in": False})
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        today = datetime.now(ET).date().isoformat()
+        day = (q.get("day") or [""])[0][:10]
+        days = morning_report_days()
+        if not day:
+            day = today if today in days else (days[0] if days else today)
+        h, m = _morning_time()
+        self._json({"logged_in": True, "day": day, "today": today, "days": days,
+                    "title": MORNING_TITLE,
+                    "report": morning_report_get(day),
+                    "portfolio": [{"symbol": s, "name": n} for s, n in morning_get_portfolio()],
+                    "state": dict(_morning_state),
+                    "schedule": f"at {(h % 12) or 12}:{m:02d} {'AM' if h < 12 else 'PM'} ET every trading day",
+                    "ai_on": bool(MORNING_AI and HAVE_SIMUCAL), "have_data": HAVE_DATA})
+
+    def _morning_post(self, body):
+        uid = self._uid()
+        if not uid:
+            return self._json({"error": "Please log in first."})
+        if self.path.startswith("/api/morning/generate"):
+            started = morning_run_async(use_ai=bool(body.get("ai", True)))
+            return self._json({"ok": started, "error": "" if started else "Already running — hang on."})
+        if self.path.startswith("/api/morning/portfolio"):
+            sym = clean_symbol(body.get("symbol"))
+            if not sym:
+                return self._json({"error": "That doesn't look like a valid symbol."})
+            if body.get("action") == "add":
+                ok, m = morning_add(sym)
+                if not ok:
+                    return self._json({"error": m})
+            elif body.get("action") == "remove":
+                morning_remove(sym)
+            return self._json({"ok": True})
+        return self._send(404, b"not found", "text/plain")
+
     def do_HEAD(self):
         # Uptime monitors (UptimeRobot etc.) often send HEAD; answer 200 so
         # they report "up" and the request still counts as traffic.
@@ -5900,6 +6763,36 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, SIM_JS.encode("utf-8"), "application/javascript")
         elif self.path.startswith("/simucal.js"):
             self._send(200, SIMUCAL_JS.encode("utf-8"), "application/javascript")
+        elif self.path.startswith("/morning.js"):
+            self._send(200, MORNING_JS.encode("utf-8"), "application/javascript")
+        elif self.path.startswith("/api/morning/cron"):
+            # For an outside scheduler (e.g. cron-job.org) in case the server sleeps.
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if not MORNING_KEY or not hmac.compare_digest((q.get("key") or [""])[0], MORNING_KEY):
+                return self._send(403, b"forbidden", "text/plain")
+            threading.Thread(target=morning_due_job, daemon=True).start()
+            self._json({"ok": True})
+        elif self.path.startswith("/api/morning/xlsx"):
+            if not self._uid():
+                return self._send(401, b"Please log in first.", "text/plain")
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            day = (q.get("day") or [datetime.now(ET).date().isoformat()])[0][:10]
+            rep = morning_report_get(day)
+            if not rep:
+                return self._send(404, b"No report for that day yet.", "text/plain")
+            try:
+                data = morning_build_xlsx(rep)
+            except Exception as e:
+                return self._send(500, f"Export failed: {e}".encode(), "text/plain")
+            fn = _morning_filename(day)
+            self._send(200, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       extra=[("Content-Disposition", 'attachment; filename="' + fn + '"')])
+        elif self.path.startswith("/api/morning"):
+            try:
+                self._morning_get()
+            except Exception as e:
+                print(f"[MORNING] /api/morning failed: {type(e).__name__}: {e}", flush=True)
+                self._json({"logged_in": True, "fatal": f"{type(e).__name__}: {str(e)[:300]}"})
         elif self.path.startswith("/calc-widget"):
             self._send(200, CALC_PAGE.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path.startswith("/icon.png") or self.path.startswith("/apple-touch-icon"):
@@ -6049,6 +6942,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self._body()
+        if self.path.startswith("/api/morning/"):
+            try:
+                return self._morning_post(body)
+            except Exception as e:
+                print(f"[MORNING] POST {self.path} failed: {type(e).__name__}: {e}", flush=True)
+                return self._json({"error": f"{type(e).__name__}: {str(e)[:300]}"})
         if self.path.startswith("/api/simucal/export_xlsx"):
             uid = self._uid()
             if not uid:
@@ -6262,7 +7161,10 @@ def main():
           f"Earnings(Finnhub): {'ON' if HAVE_EARNINGS else 'OFF'} | "
           f"SimuCal(Anthropic): {'ON' if HAVE_SIMUCAL else 'OFF'}")
     print(f"Icon: {'icon.png found' if os.path.exists(ICON_PATH) else 'using fallback (add icon.png)'}")
+    h, m = _morning_time()
+    print(f"Morning report: {h:02d}:{m:02d} ET trading days | AI {'ON' if (MORNING_AI and HAVE_SIMUCAL) else 'OFF'}")
     threading.Thread(target=refresher, daemon=True).start()
+    threading.Thread(target=morning_scheduler, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Dipwise running on http://localhost:{PORT}  (Ctrl+C to stop)")
     try:
