@@ -3374,7 +3374,7 @@ def _morning_recent_earnings(symbols, today, days=3):
     return out
 
 
-_HOUR_LABEL = {"bmo": "before open", "amc": "after close", "dmh": "during market"}
+_MORNING_HOUR_LABEL = {"bmo": "before open", "amc": "after close", "dmh": "during market"}
 
 
 def _hint_date(hint):
@@ -3384,7 +3384,7 @@ def _hint_date(hint):
     except Exception:
         return None, ""
     code = hint.split("(")[-1].rstrip(")") if "(" in hint else ""
-    return d, _HOUR_LABEL.get(code, "")
+    return d, _MORNING_HOUR_LABEL.get(code, "")
 
 
 def _next_trading_day(d):
@@ -3563,12 +3563,99 @@ def _filter_stale(items, today, fixed):
     return keep
 
 
+MORNING_NEWS_DAYS = int(os.environ.get("MORNING_NEWS_DAYS", "4"))
+MORNING_NEWS_PER = int(os.environ.get("MORNING_NEWS_PER", "6"))
+_GENERIC_WORDS = {"inc", "inc.", "corp", "corp.", "co", "co.", "corporation", "company", "plc",
+                  "ltd", "the", "group", "holdings", "&"}
+
+
+def _news_keywords(sym, name):
+    """Words a headline should contain to count as about this company."""
+    keys = {sym.upper()}
+    hint = _EARN_NAME_HINT.get(sym.upper())
+    if hint:
+        keys.add(hint.lower())
+    words = [w for w in re.split(r"[\s,]+", (name or "").strip()) if w]
+    if words:
+        first = words[0].strip(".,").lower()
+        if len(first) <= 3 and len(words) > 1 and words[1].lower().strip(".,") not in _GENERIC_WORDS:
+            keys.add(first + " " + words[1].strip(".,").lower())   # "GE Vernova", not just "GE"
+        elif first not in _GENERIC_WORDS:
+            keys.add(first)
+    return keys
+
+
+def _about_company(headline, keys):
+    h = headline.lower()
+    for k in keys:
+        if k.isupper():                       # ticker: whole word, case-sensitive
+            if re.search(r"(?<![A-Za-z])" + re.escape(k) + r"(?![A-Za-z])", headline):
+                return True
+        elif k in h:
+            return True
+    return False
+
+
+def _clean_headlines(rows, sym, name, today, per=MORNING_NEWS_PER):
+    """Finnhub company-news rows -> ['(Nov 17) Headline — Source', ...] newest first,
+    only ones that name the company, duplicates removed."""
+    keys = _news_keywords(sym, name)
+    out, seen = [], set()
+    for r in sorted(rows or [], key=lambda r: r.get("datetime") or 0, reverse=True):
+        h = re.sub(r"\s+", " ", (r.get("headline") or "")).strip()
+        if not h or not r.get("datetime"):
+            continue
+        k = re.sub(r"[^a-z0-9 ]", "", h.lower())[:60]
+        if k in seen or not _about_company(h, keys):
+            continue
+        seen.add(k)
+        d = datetime.fromtimestamp(r["datetime"], ET).date()
+        if d > today:
+            continue
+        src = (r.get("source") or "").strip()
+        out.append(f"({d.strftime('%b %-d')}) {h[:150]}" + (f" — {src}" if src else ""))
+        if len(out) >= per:
+            break
+    return out
+
+
+def _morning_finnhub_news(symbols, names, today):
+    """{sym: [dated headlines]} from Finnhub company news (free tier, US names).
+    Given to Claude as the starting point so the News column is built from real,
+    dated headlines instead of whatever a web search turns up."""
+    if not HAVE_EARNINGS or not symbols:
+        return {}
+    dfrom = (today - timedelta(days=MORNING_NEWS_DAYS)).isoformat()
+
+    def one(s):
+        try:
+            rows = _finnhub_get("/company-news", {"symbol": s, "from": dfrom, "to": today.isoformat()})
+            return s, _clean_headlines(rows if isinstance(rows, list) else [], s, names.get(s, ""), today)
+        except Exception as e:
+            print(f"[MORNING] Finnhub news {s} failed: {str(e)[:100]}", flush=True)
+            return s, []
+
+    out = {}
+    # Free tier is 60 calls/min; 4 at a time keeps a 28-stock portfolio well under it.
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for s, items in ex.map(one, symbols):
+            if items:
+                out[s] = items
+    return out
+
+
 MORNING_PROMPT = """You are preparing the "News / Alerts / Risks", "Ex-dividend Date" and "Earnings Date"
 columns of a pre-market portfolio report for a retired investor. Today is {today_long}
 (US Eastern, before the market opens). Use web search to check CURRENT information.
 
 Tickers (with company name, last close and Finnhub's next-earnings hint, which may be an estimate):
 {lines}
+
+HOW TO USE THE HEADLINES: each ticker comes with real, dated headlines from Finnhub. Build
+"news" from THOSE first and keep their dates. Only use a headline for the ticker it is
+listed under. Use web search to check a headline that looks surprising, to fill gaps when a
+ticker has few or no headlines, and for ex-dividend and earnings dates. Don't add details
+that neither the headlines nor your searches support.
 
 For EACH ticker return:
 - "name": short company name (e.g. "Apple Inc."). If the ticker is not publicly traded or
@@ -3601,21 +3688,32 @@ Return ONLY a JSON object, no markdown fences, no commentary:
 Include every ticker listed above exactly once."""
 
 
-def _morning_claude_batch(batch, names, prices, hints, today, recent=None):
-    recent = recent or {}
-    lines = "\n".join(
-        f"- {s} ({names.get(s) or 'name unknown'}) | last close "
-        f"{('$%.2f' % prices[s]['close']) if prices.get(s, {}).get('close') else 'n/a'}"
-        f" | earnings hint: {hints.get(s, 'unknown')}"
-        + (f" | JUST REPORTED {recent[s]}: lead the news with the results and the stock's reaction"
-           if recent.get(s) else "") for s in batch)
+def _morning_claude_batch(batch, names, prices, hints, today, recent=None, news=None):
+    recent, news = recent or {}, news or {}
+
+    def block(s):
+        line = (f"- {s} ({names.get(s) or 'name unknown'}) | last close "
+                f"{('$%.2f' % prices[s]['close']) if prices.get(s, {}).get('close') else 'n/a'}"
+                f" | earnings hint: {hints.get(s, 'unknown')}")
+        if recent.get(s):
+            line += f" | JUST REPORTED {recent[s]}: lead the news with the results and the stock's reaction"
+        heads = news.get(s) or []
+        if heads:
+            line += "\n    Headlines (Finnhub, newest first):\n" + "\n".join("      " + h for h in heads)
+        else:
+            line += "\n    Headlines (Finnhub): none found, use web search"
+        return line
+
+    lines = "\n".join(block(s) for s in batch)
     prompt = MORNING_PROMPT.format(today_long=today.strftime("%A, %B %d, %Y"), lines=lines)
+    # Headlines cover most names, so fewer searches are needed (saves API credit).
+    n_searches = len(batch) * 2 if not news else max(3, len(batch))
     payload = {
         "model": ANTHROPIC_MODEL,
         "max_tokens": 4000,
         "messages": [{"role": "user", "content": prompt}],
         "tools": [{"type": "web_search_20250305", "name": "web_search",
-                   "max_uses": max(4, len(batch) * 2)}],
+                   "max_uses": n_searches}],
     }
     req = urllib.request.Request(
         ANTHROPIC_URL, data=json.dumps(payload).encode("utf-8"), method="POST",
@@ -3646,13 +3744,17 @@ def morning_ai_columns(symbols, names, prices, today):
     """Claude over the portfolio in parallel batches. Returns ({sym: cols}, [errors])."""
     hints = _morning_finnhub_earnings(symbols, today)
     recent = _morning_recent_earnings(symbols, today)
+    _morning_state["step"] = "Pulling headlines from Finnhub…"
+    news = _morning_finnhub_news(symbols, names, today)
+    print(f"[MORNING] Finnhub headlines for {len(news)}/{len(symbols)} stocks", flush=True)
+    _morning_state["step"] = f"Claude is researching news for {len(symbols)} stocks (2–4 min)…"
     batches = [symbols[i:i + MORNING_BATCH] for i in range(0, len(symbols), MORNING_BATCH)]
     cols, errors = {}, []
 
     def run(b):
         for attempt in (1, 2):
             try:
-                return _morning_claude_batch(b, names, prices, hints, today, recent)
+                return _morning_claude_batch(b, names, prices, hints, today, recent, news)
             except Exception as e:
                 if "credit balance" in str(e).lower():   # retrying won't help
                     errors.append("__credit__")
@@ -3669,18 +3771,22 @@ def morning_ai_columns(symbols, names, prices, today):
     if "__credit__" in errors:
         errors = [e for e in errors if e != "__credit__"]
         errors.insert(0, "Claude is out of API credits, so news wasn't researched. Add credits in the "
-                         "Claude Console (Settings > Billing), then press Rebuild with Claude. Earnings "
-                         "and dividends below come from Finnhub/Alpaca as a backup.")
+                         "Claude Console (Settings > Billing), then press Rebuild with Claude. Headlines, "
+                         "earnings and dividends below come from Finnhub/Alpaca as a backup.")
 
     missing = [s for s in symbols if s not in cols]
     divs = _morning_alpaca_dividends(missing, today) if missing else {}
     for s in symbols:
         c = cols.setdefault(s, {})
-        # Earnings: Finnhub date for anything Claude missed
-        if s in hints and not c.get("earnings"):
+        # Earnings: Finnhub's calendar wins over Claude's guess, so "est." dates don't
+        # wander between rebuilds. A date Claude says is confirmed (no "est.") is kept.
+        if s in hints and (not c.get("earnings") or "est" in str(c.get("earnings")).lower()):
             d, _ = _hint_date(hints[s])
             if d:
                 c["earnings"] = d.strftime("%b %-d, %Y") + " (est.)"
+        # News backup: Claude didn't answer for this name, so show the top real headlines
+        if not c.get("news") and news.get(s):
+            c["news"] = "; ".join(h.split(" — ")[0] for h in news[s][:2])
         # Flag reports due today / next trading day, even when Claude filled the column
         flag = _earnings_flag(hints.get(s), today)
         if flag and not str(c.get("earnings") or "").upper().startswith(("TODAY", "TOMORROW")):
