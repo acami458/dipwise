@@ -3596,14 +3596,27 @@ def _about_company(headline, keys):
     return False
 
 
+# Opinion pieces, listicles, fund-flow and comparison articles: not news for the report.
+_FLUFF_RE = re.compile(
+    r"\?\s*$"                                   # question headlines: "Is X a buy?"
+    r"|\b(should you|is it time|buy now|buy or sell|to buy|to watch|to own|to hold)\b"
+    r"|\b(top|best) \d+\b|\b\d+ (stocks|reasons|things)\b"
+    r"|\bETF\b|\bfund\b.*\b(buys|sells|stake|position)\b|\b(acquires|sells|trims|boosts|lifts) (new )?(stake|position|holdings)\b"
+    r"|\bvs\.?\s|\bversus\b|\bwhich is (the )?better\b|\bcomparison\b"
+    r"|\b(sentiment|valuation|fair value|cash flow|undervalued|overvalued)\b"
+    r"|\bstock (rises|falls|drops|jumps|gains|slips|moves|trades)\b(?!.*\b(after|on|as)\b)"
+    r"|\bhere'?s (why|what|how)\b|\bwhat to (know|expect)\b|\b\$\d+[kK]? investment\b",
+    re.I)
+
+
 def _clean_headlines(rows, sym, name, today, per=MORNING_NEWS_PER):
     """Finnhub company-news rows -> ['(Nov 17) Headline — Source', ...] newest first,
-    only ones that name the company, duplicates removed."""
+    only real news that names the company, duplicates and filler removed."""
     keys = _news_keywords(sym, name)
     out, seen = [], set()
     for r in sorted(rows or [], key=lambda r: r.get("datetime") or 0, reverse=True):
         h = re.sub(r"\s+", " ", (r.get("headline") or "")).strip()
-        if not h or not r.get("datetime"):
+        if not h or not r.get("datetime") or _FLUFF_RE.search(h):
             continue
         k = re.sub(r"[^a-z0-9 ]", "", h.lower())[:60]
         if k in seen or not _about_company(h, keys):
@@ -3651,11 +3664,14 @@ columns of a pre-market portfolio report for a retired investor. Today is {today
 Tickers (with company name, last close and Finnhub's next-earnings hint, which may be an estimate):
 {lines}
 
-HOW TO USE THE HEADLINES: each ticker comes with real, dated headlines from Finnhub. Build
-"news" from THOSE first and keep their dates. Only use a headline for the ticker it is
-listed under. Use web search to check a headline that looks surprising, to fill gaps when a
-ticker has few or no headlines, and for ex-dividend and earnings dates. Don't add details
-that neither the headlines nor your searches support.
+HOW TO USE THE HEADLINES: each ticker comes with real, dated headlines from Finnhub. Use
+them as your starting point and keep their dates, but only the ones that MATTER to an
+investor: analyst rating/target changes, earnings and guidance, deals and M&A, management
+changes, legal/regulatory, big product or contract news, dividends. Skip minor items
+(donations, small partnerships, opinion pieces). Only use a headline for the ticker it is
+listed under. If a ticker's headlines are thin or minor, web search for the real news.
+Always web search to confirm ex-dividend dates and amounts; a DECLARED date beats an
+estimate. Don't add details that neither the headlines nor your searches support.
 
 For EACH ticker return:
 - "name": short company name (e.g. "Apple Inc."). If the ticker is not publicly traded or
@@ -3706,8 +3722,9 @@ def _morning_claude_batch(batch, names, prices, hints, today, recent=None, news=
 
     lines = "\n".join(block(s) for s in batch)
     prompt = MORNING_PROMPT.format(today_long=today.strftime("%A, %B %d, %Y"), lines=lines)
-    # Headlines cover most names, so fewer searches are needed (saves API credit).
-    n_searches = len(batch) * 2 if not news else max(3, len(batch))
+    # Keep the full search budget: Claude still needs searches for ex-dividend dates
+    # and for names whose headlines are thin.
+    n_searches = max(4, len(batch) * 2)
     payload = {
         "model": ANTHROPIC_MODEL,
         "max_tokens": 4000,
@@ -3774,8 +3791,10 @@ def morning_ai_columns(symbols, names, prices, today):
                          "Claude Console (Settings > Billing), then press Rebuild with Claude. Headlines, "
                          "earnings and dividends below come from Finnhub/Alpaca as a backup.")
 
-    missing = [s for s in symbols if s not in cols]
-    divs = _morning_alpaca_dividends(missing, today) if missing else {}
+    # Declared ex-dividend dates from Alpaca for EVERY name: an announced date beats
+    # Claude's estimate (e.g. MPC ex-div today at $1.10, not "~Nov 25 (est.)").
+    divs = _morning_alpaca_dividends(symbols, today)
+    print(f"[MORNING] Alpaca declared dividends for {len(divs)}/{len(symbols)} stocks", flush=True)
     for s in symbols:
         c = cols.setdefault(s, {})
         # Earnings: Finnhub's calendar wins over Claude's guess, so "est." dates don't
@@ -3803,8 +3822,10 @@ def morning_ai_columns(symbols, names, prices, today):
                     c["level"] = "high"
         if not c.get("news") and flag:
             c["news"] = f"📅 Earnings {flag}."
-        # Ex-dividend backup from Alpaca when Claude didn't answer for this name
-        if s in divs and (not c.get("exdiv") or c.get("exdiv") == "—"):
+        # Ex-dividend: Alpaca's declared date wins over anything Claude estimated
+        if s in divs:
+            if c.get("exdiv") and c.get("exdiv") not in ("—", divs[s]):
+                print(f"[MORNING] {s}: ex-div {c.get('exdiv')!r} -> declared {divs[s]!r}", flush=True)
             c["exdiv"] = divs[s]
         # Sanity checks on what Claude wrote (past dates, wrong TODAY/TOMORROW, odd PTs)
         try:
