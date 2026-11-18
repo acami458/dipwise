@@ -3448,9 +3448,25 @@ def _morning_alpaca_dividends(symbols, today, days=60):
 _MON_RE = re.compile(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2})(?:,?\s+(\d{4}))?\b")
 _MONTHS = {m: i for i, m in enumerate(
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
-_PT_RE = re.compile(r"(?:price target|\bPT\b|\btarget\b)[^$;]{0,25}\$(\d[\d,]*(?:\.\d+)?)", re.I)
-# Targets for gold/oil/indexes (e.g. GLD rows) aren't stock price targets: don't compare them
-_PT_SKIP_RE = re.compile(r"\b(gold|oil|ounce|oz|barrel|index|S&P|year-end)\b", re.I)
+_PT_VERB_RE = re.compile(r"\b(PT|price target|target|raised|raises|cut|cuts|lowered|lowers|upgrade[sd]?|downgrade[sd]?|initiated|reiterated|maintains?)\b", re.I)
+# Not analyst price targets: commodities/indexes, dividends, results, deal sizes
+_PT_SKIP_RE = re.compile(r"\b(gold|oil|ounce|oz|barrel|index|S&P|year-end|dividend|div|EPS|revenue|rev|sales|buyback|guidance|per share|/sh)\b", re.I)
+_DOLLAR_RE = re.compile(r"\$(\d[\d,]*(?:\.\d+)?)(?!\d|[.,]\d|\s*(?:[BMKT]\b|bn\b|billion|million|trillion|/))", re.I)
+
+
+def _bad_target(it, close):
+    """A $ figure in an analyst-move item that can't be this stock's price target
+    (e.g. MA's $764 Bernstein target showing up in the KO row)."""
+    if not close or not _PT_VERB_RE.search(it) or _PT_SKIP_RE.search(it):
+        return None
+    for v in _DOLLAR_RE.findall(it):
+        try:
+            x = float(v.replace(",", ""))
+        except ValueError:
+            continue
+        if x < close * 0.5 or x > close * 2.5:
+            return x
+    return None
 
 
 def _dates_in(text, today):
@@ -3488,15 +3504,10 @@ def _morning_sanitize(c, close, today):
     keep = []
     for it in (x.strip() for x in news.split(";")):
         # 2a. Price target wildly off this stock's price -> another ticker's number
-        m = None if _PT_SKIP_RE.search(it) else _PT_RE.search(it)
-        if m and close:
-            try:
-                pt = float(m.group(1).replace(",", ""))
-            except ValueError:
-                pt = None
-            if pt and (pt < close * 0.5 or pt > close * 2.5):
-                fixed.append(f"dropped PT ${pt:g} vs price ${close:g}")
-                continue
+        pt = _bad_target(it, close)
+        if pt is not None:
+            fixed.append(f"dropped target ${pt:g} vs price ${close:g}: '{it[:50]}'")
+            continue
         # 2b. TODAY / TOMORROW only when the item's own dates back it up
         for word, ok in (("TOMORROW", nxt), ("TODAY", today)):
             if re.search(r"\b" + word + r"\b(?!')", it):
