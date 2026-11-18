@@ -3448,7 +3448,9 @@ def _morning_alpaca_dividends(symbols, today, days=60):
 _MON_RE = re.compile(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2})(?:,?\s+(\d{4}))?\b")
 _MONTHS = {m: i for i, m in enumerate(
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
-_PT_RE = re.compile(r"(?:price target|\bPT\b)[^$;]{0,25}\$(\d[\d,]*(?:\.\d+)?)", re.I)
+_PT_RE = re.compile(r"(?:price target|\bPT\b|\btarget\b)[^$;]{0,25}\$(\d[\d,]*(?:\.\d+)?)", re.I)
+# Targets for gold/oil/indexes (e.g. GLD rows) aren't stock price targets: don't compare them
+_PT_SKIP_RE = re.compile(r"\b(gold|oil|ounce|oz|barrel|index|S&P|year-end)\b", re.I)
 
 
 def _dates_in(text, today):
@@ -3486,7 +3488,7 @@ def _morning_sanitize(c, close, today):
     keep = []
     for it in (x.strip() for x in news.split(";")):
         # 2a. Price target wildly off this stock's price -> another ticker's number
-        m = _PT_RE.search(it)
+        m = None if _PT_SKIP_RE.search(it) else _PT_RE.search(it)
         if m and close:
             try:
                 pt = float(m.group(1).replace(",", ""))
