@@ -3355,6 +3355,159 @@ def _morning_finnhub_earnings(symbols, today):
     return out
 
 
+def _morning_recent_earnings(symbols, today, days=3):
+    """{sym: "YYYY-MM-DD (bmo|amc)"} for names that reported in the last few days
+    (e.g. NVDA after yesterday's close). The forward-looking hint skips these, so
+    without this the report jumps straight to next quarter's date."""
+    if not HAVE_EARNINGS:
+        return {}
+    want, out = set(symbols), {}
+    try:
+        rows = fetch_earnings_calendar((today - timedelta(days=days)).isoformat(),
+                                       (today - timedelta(days=1)).isoformat()) or []
+    except Exception:
+        return {}
+    for r in sorted(rows, key=lambda r: r.get("date") or "", reverse=True):
+        s = (r.get("symbol") or "").upper()
+        if s in want and s not in out and r.get("date"):
+            out[s] = r["date"] + (f" ({r['hour']})" if r.get("hour") else "")
+    return out
+
+
+_HOUR_LABEL = {"bmo": "before open", "amc": "after close", "dmh": "during market"}
+
+
+def _hint_date(hint):
+    """'YYYY-MM-DD (amc)' -> (date, 'after close')"""
+    try:
+        d = datetime.strptime((hint or "").split(" ")[0], "%Y-%m-%d").date()
+    except Exception:
+        return None, ""
+    code = hint.split("(")[-1].rstrip(")") if "(" in hint else ""
+    return d, _HOUR_LABEL.get(code, "")
+
+
+def _next_trading_day(d):
+    n = d + timedelta(days=1)
+    while n.weekday() >= 5:
+        n += timedelta(days=1)
+    return n
+
+
+def _earnings_flag(hint, today):
+    """'TODAY (after close)' / 'TOMORROW (before open)' / '' from a Finnhub hint."""
+    d, when = _hint_date(hint or "")
+    if not d:
+        return ""
+    tag = "TODAY" if d == today else "TOMORROW" if d == _next_trading_day(today) else ""
+    return (tag + (f" ({when})" if when else "")) if tag else ""
+
+
+_ALPACA_CA_URL = "https://data.alpaca.markets/v1/corporate-actions"
+
+
+def _morning_alpaca_dividends(symbols, today, days=60):
+    """{sym: "Nov 20 ($0.53)"} next declared ex-dividend date from Alpaca's
+    corporate-actions feed (free plan). Backup for when Claude is unavailable."""
+    if not HAVE_DATA or not symbols:
+        return {}
+    headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET,
+               "Accept": "application/json"}
+    params = {"symbols": ",".join(symbols), "types": "cash_dividend",
+              "start": today.isoformat(), "end": (today + timedelta(days=days)).isoformat(),
+              "limit": 1000}
+    found, token = [], None
+    try:
+        for _ in range(5):
+            if token:
+                params["page_token"] = token
+            req = urllib.request.Request(_ALPACA_CA_URL + "?" + urllib.parse.urlencode(params),
+                                         headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            found += (data.get("corporate_actions") or {}).get("cash_dividends") or []
+            token = data.get("next_page_token")
+            if not token:
+                break
+    except Exception as e:
+        print(f"[MORNING] Alpaca dividends lookup failed: {str(e)[:160]}", flush=True)
+        return {}
+    out = {}
+    for r in sorted(found, key=lambda r: r.get("ex_date") or ""):
+        s = (r.get("symbol") or "").upper()
+        try:
+            d = datetime.strptime(r.get("ex_date") or "", "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if s in symbols and s not in out and d >= today:
+            rate = r.get("rate")
+            out[s] = d.strftime("%b %-d") + (f" (${float(rate):.2f})" if rate else "")
+    return out
+
+
+_MON_RE = re.compile(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2})(?:,?\s+(\d{4}))?\b")
+_MONTHS = {m: i for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
+_PT_RE = re.compile(r"(?:price target|\bPT\b)[^$;]{0,25}\$(\d[\d,]*(?:\.\d+)?)", re.I)
+
+
+def _dates_in(text, today):
+    """Every 'Nov 24' / 'Jan 20, 2027' in text as dates. A date with no year that
+    would fall more than ~6 months back is taken to mean next year."""
+    out = []
+    for m in _MON_RE.finditer(text or ""):
+        try:
+            y = int(m.group(3)) if m.group(3) else today.year
+            d = datetime(y, _MONTHS[m.group(1)], int(m.group(2))).date()
+        except ValueError:
+            continue
+        if not m.group(3) and (today - d).days > 180:
+            d = datetime(y + 1, d.month, d.day).date()
+        out.append(d)
+    return out
+
+
+def _morning_sanitize(c, close, today):
+    """Catch the mechanical mistakes Claude makes in the morning columns:
+    past ex-dividend dates, TODAY/TOMORROW on items that aren't, and price
+    targets that can't belong to this stock. Fixes c in place; returns notes."""
+    fixed = []
+    # 1. Ex-dividend must be today or later
+    ex = c.get("exdiv") or ""
+    ds = _dates_in(ex, today)
+    if ds and ds[0] < today:
+        c["exdiv"] = "—"
+        fixed.append(f"dropped past ex-div '{ex}'")
+    # 2. News, one ';'-separated item at a time
+    news = c.get("news") or ""
+    if not news:
+        return fixed
+    nxt = _next_trading_day(today)
+    keep = []
+    for it in (x.strip() for x in news.split(";")):
+        # 2a. Price target wildly off this stock's price -> another ticker's number
+        m = _PT_RE.search(it)
+        if m and close:
+            try:
+                pt = float(m.group(1).replace(",", ""))
+            except ValueError:
+                pt = None
+            if pt and (pt < close * 0.5 or pt > close * 2.5):
+                fixed.append(f"dropped PT ${pt:g} vs price ${close:g}")
+                continue
+        # 2b. TODAY / TOMORROW only when the item's own dates back it up
+        for word, ok in (("TOMORROW", nxt), ("TODAY", today)):
+            if re.search(r"\b" + word + r"\b(?!')", it):
+                ds = _dates_in(it, today)
+                if ds and ok not in ds:
+                    it = re.sub(r"\s*\b" + word + r"\b(?!'):?", "", it).strip()
+                    fixed.append(f"removed {word}: '{it[:50]}'")
+        if it:
+            keep.append(it)
+    c["news"] = "; ".join(keep)
+    return fixed
+
+
 MORNING_PROMPT = """You are preparing the "News / Alerts / Risks", "Ex-dividend Date" and "Earnings Date"
 columns of a pre-market portfolio report for a retired investor. Today is {today_long}
 (US Eastern, before the market opens). Use web search to check CURRENT information.
@@ -3372,8 +3525,13 @@ For EACH ticker return:
   use "TODAY"/"TOMORROW" in caps for imminent binary events. If nothing new in 3 days,
   give the most relevant recent item WITH its date. Never repeat old news as if new.
   Be precise with numbers: if a figure is a total across several companies, say so.
+  Use TODAY only for events on {today_long}, and TOMORROW only for the next trading day;
+  for anything later, write the event's own date (e.g. "earnings Nov 24").
+  Analyst price targets must be for THIS ticker; double-check each one against the
+  stock's last close before including it. Never copy a figure from another ticker.
 - "level": "high" (major mover / must-read this morning), "risk" (⚠ item), "normal", or "na".
-- "exdiv": the next ex-dividend date with the per-payment amount, e.g. "Nov 20 ($0.53)".
+- "exdiv": the NEXT ex-dividend date ON OR AFTER today, with the per-payment amount,
+  e.g. "Nov 20 ($0.53)". Never give a date that has already passed.
   If declared, give it as is. If not yet declared but the regular pattern puts it within
   the next ~60 days, give "~Nov 18 (est. $1.00)". Otherwise "—". ETFs with no
   distribution: "— (ETF)". No dividend at all: "—".
@@ -3386,11 +3544,14 @@ Return ONLY a JSON object, no markdown fences, no commentary:
 Include every ticker listed above exactly once."""
 
 
-def _morning_claude_batch(batch, names, prices, hints, today):
+def _morning_claude_batch(batch, names, prices, hints, today, recent=None):
+    recent = recent or {}
     lines = "\n".join(
         f"- {s} ({names.get(s) or 'name unknown'}) | last close "
         f"{('$%.2f' % prices[s]['close']) if prices.get(s, {}).get('close') else 'n/a'}"
-        f" | earnings hint: {hints.get(s, 'unknown')}" for s in batch)
+        f" | earnings hint: {hints.get(s, 'unknown')}"
+        + (f" | JUST REPORTED {recent[s]}: lead the news with the results and the stock's reaction"
+           if recent.get(s) else "") for s in batch)
     prompt = MORNING_PROMPT.format(today_long=today.strftime("%A, %B %d, %Y"), lines=lines)
     payload = {
         "model": ANTHROPIC_MODEL,
@@ -3427,14 +3588,18 @@ def _morning_claude_batch(batch, names, prices, hints, today):
 def morning_ai_columns(symbols, names, prices, today):
     """Claude over the portfolio in parallel batches. Returns ({sym: cols}, [errors])."""
     hints = _morning_finnhub_earnings(symbols, today)
+    recent = _morning_recent_earnings(symbols, today)
     batches = [symbols[i:i + MORNING_BATCH] for i in range(0, len(symbols), MORNING_BATCH)]
     cols, errors = {}, []
 
     def run(b):
         for attempt in (1, 2):
             try:
-                return _morning_claude_batch(b, names, prices, hints, today)
+                return _morning_claude_batch(b, names, prices, hints, today, recent)
             except Exception as e:
+                if "credit balance" in str(e).lower():   # retrying won't help
+                    errors.append("__credit__")
+                    return {}
                 if attempt == 2:
                     errors.append(f"{b[0]}–{b[-1]}: {str(e)[:160]}")
                 time.sleep(5)
@@ -3443,13 +3608,47 @@ def morning_ai_columns(symbols, names, prices, today):
     with ThreadPoolExecutor(max_workers=3) as ex:
         for res in ex.map(run, batches):
             cols.update(res)
-    for s in symbols:   # Finnhub earnings date for anything Claude missed
-        if s in hints and not (cols.get(s) or {}).get("earnings"):
-            try:
-                d = datetime.strptime(hints[s].split(" ")[0], "%Y-%m-%d")
-                cols.setdefault(s, {})["earnings"] = d.strftime("%b %-d, %Y") + " (est.)"
-            except Exception:
-                pass
+
+    if "__credit__" in errors:
+        errors = [e for e in errors if e != "__credit__"]
+        errors.insert(0, "Claude is out of API credits, so news wasn't researched. Add credits in the "
+                         "Claude Console (Settings > Billing), then press Rebuild with Claude. Earnings "
+                         "and dividends below come from Finnhub/Alpaca as a backup.")
+
+    missing = [s for s in symbols if s not in cols]
+    divs = _morning_alpaca_dividends(missing, today) if missing else {}
+    for s in symbols:
+        c = cols.setdefault(s, {})
+        # Earnings: Finnhub date for anything Claude missed
+        if s in hints and not c.get("earnings"):
+            d, _ = _hint_date(hints[s])
+            if d:
+                c["earnings"] = d.strftime("%b %-d, %Y") + " (est.)"
+        # Flag reports due today / next trading day, even when Claude filled the column
+        flag = _earnings_flag(hints.get(s), today)
+        if flag and not str(c.get("earnings") or "").upper().startswith(("TODAY", "TOMORROW")):
+            c["earnings"] = flag + " · " + (c.get("earnings") or "")
+        # Just reported (e.g. last night): don't let it silently roll to next quarter
+        if s in recent:
+            d, when = _hint_date(recent[s])
+            if d:
+                note = f"Reported {d.strftime('%b %-d')}" + (f" ({when})" if when else "")
+                if not str(c.get("earnings") or "").startswith("Reported"):
+                    c["earnings"] = note + (" · next " + c["earnings"] if c.get("earnings") else "")
+                if not c.get("news"):
+                    c["news"] = f"📊 {note}: check results and guidance before the open."
+                    c["level"] = "high"
+        if not c.get("news") and flag:
+            c["news"] = f"📅 Earnings {flag}."
+        # Ex-dividend backup from Alpaca when Claude didn't answer for this name
+        if s in divs and (not c.get("exdiv") or c.get("exdiv") == "—"):
+            c["exdiv"] = divs[s]
+        # Sanity checks on what Claude wrote (past dates, wrong TODAY/TOMORROW, odd PTs)
+        try:
+            for note in _morning_sanitize(c, (prices.get(s) or {}).get("close"), today):
+                print(f"[MORNING] {s}: {note}", flush=True)
+        except Exception as e:
+            print(f"[MORNING] {s}: sanitize skipped ({str(e)[:80]})", flush=True)
     return cols, errors
 
 
@@ -4947,7 +5146,7 @@ MORNING_JS = r"""/* ============================================================
   info.push('runs automatically '+esc(d.schedule));
   if(!d.ai_on)info.push('<b>Claude is off</b> (needs ANTHROPIC_API_KEY, MORNING_AI≠0) — prices only');
   h+='<div class="muted" style="font-size:12px;margin:2px 0 10px;color:#4b5563">'+info.join(' · ')+'</div>';
-  if(r&&r.errors&&r.errors.length){h+='<div class="warn">Some stocks are missing news: '+esc(r.errors.join(' | '))+'</div>';}
+  if(r&&r.errors&&r.errors.length){h+='<div class="warn">'+(r.errors[0].indexOf('API credits')>=0?'💳 ':'Some stocks are missing news: ')+esc(r.errors.join(' | '))+'</div>';}
   if(!r){
    h+='<div class="empty" style="margin:18px 0">No report for '+esc(longDay(d.day))+' yet.'+(d.day===d.today?' It builds itself '+esc(d.schedule)+', or press <b>✨ Rebuild with Claude</b> to make it now (2–4 min).':'')+'</div>';
   }else{h+=table(r);}
