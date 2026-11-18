@@ -3504,8 +3504,50 @@ def _morning_sanitize(c, close, today):
                     fixed.append(f"removed {word}: '{it[:50]}'")
         if it:
             keep.append(it)
+    # 3. Old news dropped, undated news labelled
+    keep = _filter_stale(keep, today, fixed)
     c["news"] = "; ".join(keep)
     return fixed
+
+
+_MON_ONLY_RE = re.compile(r"\((Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\)")
+STALE_DAYS = 21
+
+
+def _item_age_check(it, today):
+    """'ok' | 'stale' | 'undated' for one news item."""
+    ds = _dates_in(it, today)
+    if ds:
+        return "stale" if max(ds) < today - timedelta(days=STALE_DAYS) else "ok"
+    m = _MON_ONLY_RE.search(it)
+    if m:   # "(Oct)": stale once that whole month is more than STALE_DAYS back
+        mon = _MONTHS[m.group(1)]
+        y = today.year if mon <= today.month else today.year - 1
+        end = (datetime(y + (mon == 12), mon % 12 + 1, 1) - timedelta(days=1)).date()
+        return "stale" if end < today - timedelta(days=STALE_DAYS) else "ok"
+    if re.search(r"\b(TODAY|TOMORROW)\b", it):
+        return "ok"
+    return "undated"
+
+
+def _filter_stale(items, today, fixed):
+    keep = []
+    ages = [_item_age_check(it, today) for it in items]
+    for i, it in enumerate(items):
+        age = ages[i]
+        # "Beat Q3 ...; raised outlook ...; up 4% (Nov 17)": one date at the end covers the run
+        if age == "undated" and any(a != "undated" for a in ages[i + 1:]):
+            age = next(a for a in ages[i + 1:] if a != "undated")
+        if age == "stale":
+            fixed.append(f"dropped stale: '{it[:50]}'")
+            continue
+        if age == "undated" and not it.endswith("(undated)"):
+            it += " (undated)"
+            fixed.append(f"marked undated: '{it[:50]}'")
+        keep.append(it)
+    if items and not keep:      # everything was old: keep the first one, labelled
+        keep = [items[0] + " (older news)"]
+    return keep
 
 
 MORNING_PROMPT = """You are preparing the "News / Alerts / Risks", "Ex-dividend Date" and "Earnings Date"
@@ -3525,6 +3567,8 @@ For EACH ticker return:
   use "TODAY"/"TOMORROW" in caps for imminent binary events. If nothing new in 3 days,
   give the most relevant recent item WITH its date. Never repeat old news as if new.
   Be precise with numbers: if a figure is a total across several companies, say so.
+  EVERY item needs its own date in parentheses, no exceptions. Skip anything older than
+  3 weeks unless it is the only news. Results/guidance must be from the MOST RECENT report.
   Use TODAY only for events on {today_long}, and TOMORROW only for the next trading day;
   for anything later, write the event's own date (e.g. "earnings Nov 24").
   Analyst price targets must be for THIS ticker; double-check each one against the
